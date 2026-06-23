@@ -20,12 +20,26 @@ mkdir -p "$DIR"
 WAV="$DIR/rec.wav"
 CARDF="$DIR/card"
 PROFF="$DIR/prevprofile"
+PLAYERSF="$DIR/players"   # MPRIS players we paused on START, to resume on STOP
 UNIT="dictation-rec"
 MODEL="${DICTATION_MODEL:-whisper-small.en-fp16-ov}"
 URL="http://127.0.0.1:8009/transcribe/$MODEL"
 MAX="${DICTATION_MAX_SECONDS:-300}"
 
 note() { notify-send -t 5000 -a dictation "Dictation" "$1" 2>/dev/null || true; }
+
+# Resume exactly the media players we paused on START (see pause block below). Safe to call
+# on any STOP/cleanup path — a no-op if we paused nothing.
+resume_players() {
+  [ -f "$PLAYERSF" ] || return 0
+  if command -v playerctl >/dev/null 2>&1; then
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      playerctl -p "$p" play 2>/dev/null || true
+    done <"$PLAYERSF"
+  fi
+  rm -f "$PLAYERSF"
+}
 
 # Single-instance guard. CRITICAL: close fd 9 (`9>&-`) wherever we spawn a daemonizing
 # child — wl-copy forks and would otherwise inherit this fd and hold the lock forever,
@@ -96,6 +110,7 @@ if systemctl --user is-active --quiet "$UNIT"; then
     pactl set-card-profile "$(cat "$CARDF")" "$(cat "$PROFF")" 2>/dev/null || true
   fi
   rm -f "$CARDF" "$PROFF"
+  resume_players   # A2DP is back — resume whatever we paused, before the (slower) transcribe
 
   if [ ! -s "$WAV" ] || [ "$(stat -c%s "$WAV" 2>/dev/null || echo 0)" -lt 4096 ]; then
     note "No audio captured (headset disconnected?)"
@@ -128,6 +143,19 @@ fi
 echo "$card" >"$CARDF"
 # remember the card's current active profile so we can restore it on stop
 pactl list cards | awk -v c="Name: $card" 'index($0, c){f=1} f && /Active Profile:/{print $3; exit}' >"$PROFF" || true
+
+# Pause any actively-playing media (Spotify, browser, …) BEFORE we steal the A2DP link for the
+# HFP mic — a clean MPRIS pause keeps the track's position instead of letting it run into a dead
+# sink. Record exactly which players we paused so STOP resumes just those (not ones already paused).
+: >"$PLAYERSF"
+if command -v playerctl >/dev/null 2>&1; then
+  playerctl -l 2>/dev/null | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ "$(playerctl -p "$p" status 2>/dev/null)" = "Playing" ] || continue
+    playerctl -p "$p" pause 2>/dev/null && printf '%s\n' "$p" >>"$PLAYERSF"
+  done
+fi
+
 pactl set-card-profile "$card" headset-head-unit-msbc 2>/dev/null ||
   pactl set-card-profile "$card" headset-head-unit 2>/dev/null || true
 
@@ -141,6 +169,10 @@ for _ in $(seq 1 30); do
 done
 if [ -z "$src" ]; then
   note "HFP mic did not come up"
+  # undo: restore the A2DP profile and resume anything we paused, so a failed start is invisible
+  [ -s "$PROFF" ] && pactl set-card-profile "$card" "$(cat "$PROFF")" 2>/dev/null || true
+  resume_players
+  rm -f "$CARDF" "$PROFF"
   exit 1
 fi
 

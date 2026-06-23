@@ -12,6 +12,7 @@
 , curl
 , libnotify       # notify-send
 , pulseaudio      # pactl
+, playerctl       # pause/resume media (MPRIS) around recording
 , hyprland        # hyprctl
 , util-linux      # flock
 , systemd         # systemctl / systemd-run
@@ -24,7 +25,7 @@ writeShellApplication {
   name = "dictation-toggle";
   runtimeInputs = [
     pipewire wl-clipboard wtype jq curl libnotify
-    pulseaudio hyprland util-linux systemd coreutils gnused gawk
+    pulseaudio playerctl hyprland util-linux systemd coreutils gnused gawk
   ];
   text = builtins.readFile ./dictation-toggle.sh;
 }
