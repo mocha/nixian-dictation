@@ -1,0 +1,10 @@
+# Copyrighted test clip (A Few Good Men) extracted from the upstream image — not ours to
+# redistribute. Any 16 kHz mono WAV works for testing.
+npu-image/*.wav
+
+# Reverse-engineering reference pulled out of the archived upstream image; kept locally only.
+npu-image/orig-*
+
+# Local scratch / logs
+*.log
+result*.txt
