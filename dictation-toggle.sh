@@ -135,45 +135,62 @@ if ! systemctl --user is-active --quiet whisper-npu; then
   note "Dictation server is down (whisper-npu not running)"
   exit 1
 fi
+# Pick a capture source. Prefer a Bluetooth headset (force HFP/mSBC == 16k mono Whisper input);
+# if none is connected, fall back to the default PipeWire source (USB mic, webcam, dock…) and
+# skip the BT profile dance entirely. Either way the dead internal Panther Lake mic (…sof_sdw…)
+# is rejected — there's no working capture on it.
 card=$(pactl list short cards | awk '/bluez_card/{print $2; exit}')
-if [ -z "${card:-}" ]; then
-  note "No Bluetooth headset connected"
-  exit 1
-fi
-echo "$card" >"$CARDF"
-# remember the card's current active profile so we can restore it on stop
-pactl list cards | awk -v c="Name: $card" 'index($0, c){f=1} f && /Active Profile:/{print $3; exit}' >"$PROFF" || true
+if [ -n "${card:-}" ]; then
+  # --- Bluetooth path: steal the A2DP link for an HFP mic ---------------------
+  echo "$card" >"$CARDF"
+  # remember the card's current active profile so we can restore it on stop
+  pactl list cards | awk -v c="Name: $card" 'index($0, c){f=1} f && /Active Profile:/{print $3; exit}' >"$PROFF" || true
 
-# Pause any actively-playing media (Spotify, browser, …) BEFORE we steal the A2DP link for the
-# HFP mic — a clean MPRIS pause keeps the track's position instead of letting it run into a dead
-# sink. Record exactly which players we paused so STOP resumes just those (not ones already paused).
-: >"$PLAYERSF"
-if command -v playerctl >/dev/null 2>&1; then
-  playerctl -l 2>/dev/null | while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    [ "$(playerctl -p "$p" status 2>/dev/null)" = "Playing" ] || continue
-    playerctl -p "$p" pause 2>/dev/null && printf '%s\n' "$p" >>"$PLAYERSF"
+  # Pause any actively-playing media (Spotify, browser, …) BEFORE we steal the A2DP link for the
+  # HFP mic — a clean MPRIS pause keeps the track's position instead of letting it run into a dead
+  # sink. Record exactly which players we paused so STOP resumes just those (not ones already paused).
+  : >"$PLAYERSF"
+  if command -v playerctl >/dev/null 2>&1; then
+    playerctl -l 2>/dev/null | while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      [ "$(playerctl -p "$p" status 2>/dev/null)" = "Playing" ] || continue
+      playerctl -p "$p" pause 2>/dev/null && printf '%s\n' "$p" >>"$PLAYERSF"
+    done
+  fi
+
+  pactl set-card-profile "$card" headset-head-unit-msbc 2>/dev/null ||
+    pactl set-card-profile "$card" headset-head-unit 2>/dev/null || true
+
+  # the source bound to THIS card shares its MAC: bluez_card.<MAC> → bluez_input.<MAC>*
+  mac=${card#bluez_card.}
+  src=""
+  for _ in $(seq 1 30); do
+    src=$(pactl list short sources | awk -v m="$mac" 'index($2, m){print $2; exit}')
+    [ -n "$src" ] && break
+    sleep 0.1
   done
-fi
-
-pactl set-card-profile "$card" headset-head-unit-msbc 2>/dev/null ||
-  pactl set-card-profile "$card" headset-head-unit 2>/dev/null || true
-
-# the source bound to THIS card shares its MAC: bluez_card.<MAC> → bluez_input.<MAC>*
-mac=${card#bluez_card.}
-src=""
-for _ in $(seq 1 30); do
-  src=$(pactl list short sources | awk -v m="$mac" 'index($2, m){print $2; exit}')
-  [ -n "$src" ] && break
-  sleep 0.1
-done
-if [ -z "$src" ]; then
-  note "HFP mic did not come up"
-  # undo: restore the A2DP profile and resume anything we paused, so a failed start is invisible
-  [ -s "$PROFF" ] && pactl set-card-profile "$card" "$(cat "$PROFF")" 2>/dev/null || true
-  resume_players
-  rm -f "$CARDF" "$PROFF"
-  exit 1
+  if [ -z "$src" ]; then
+    note "HFP mic did not come up"
+    # undo: restore the A2DP profile and resume anything we paused, so a failed start is invisible
+    [ -s "$PROFF" ] && pactl set-card-profile "$card" "$(cat "$PROFF")" 2>/dev/null || true
+    resume_players
+    rm -f "$CARDF" "$PROFF"
+    exit 1
+  fi
+else
+  # --- Non-Bluetooth path: record from the default source (USB mic / webcam) --
+  # No A2DP link to steal and the mic is a separate device, so there's nothing to pause and
+  # no card profile to touch/restore. Clear any stale BT state so STOP stays a clean no-op.
+  rm -f "$CARDF" "$PROFF" "$PLAYERSF"
+  src=$(pactl get-default-source 2>/dev/null || true)
+  case "${src:-}" in
+    "")
+      note "No microphone available"
+      exit 1 ;;
+    *sof_sdw*)
+      note "No usable mic (internal mic is dead — connect a headset or USB mic)"
+      exit 1 ;;
+  esac
 fi
 
 # Record inside a transient user unit so it survives this process exiting. SIGINT on stop
