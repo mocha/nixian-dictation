@@ -12,8 +12,10 @@
 #           and blocks until it exits; POST the WAV raw to the warm NPU server; copy the text;
 #           paste via the focused app's own paste shortcut; restore the previous BT profile.
 #
-# Env overrides: DICTATION_MODEL, DICTATION_MAX_SECONDS, DICTATION_WRAP=auto|always|never,
-#                DICTATION_NOPASTE=1 (copy only).
+# Env overrides: DICTATION_MODEL, DICTATION_MAX_SECONDS (empty/0 = no cap, the default),
+#                DICTATION_HTTP_TIMEOUT (transcribe POST timeout, seconds), DICTATION_WRAP=auto|always|never,
+#                DICTATION_NOPASTE=1 (copy only), DICTATION_NOSOUND=1 (no start/stop chime),
+#                DICTATION_SOUNDS (sound dir), DICTATION_SND_START / DICTATION_SND_STOP (filenames).
 
 DIR="${XDG_RUNTIME_DIR:-/tmp}/dictation"
 mkdir -p "$DIR"
@@ -24,9 +26,31 @@ PLAYERSF="$DIR/players"   # MPRIS players we paused on START, to resume on STOP
 UNIT="dictation-rec"
 MODEL="${DICTATION_MODEL:-whisper-small.en-fp16-ov}"
 URL="http://127.0.0.1:8009/transcribe/$MODEL"
-MAX="${DICTATION_MAX_SECONDS:-300}"
+# No recording cap by default: when RuntimeMaxSec fires it just kills the transient unit, so the
+# STOP branch (which POSTs the WAV + pastes) never runs and the audio is silently lost. Set
+# DICTATION_MAX_SECONDS=<seconds> to re-add a safety cap (with that same drop-on-expiry caveat).
+MAX="${DICTATION_MAX_SECONDS:-}"
+# Transcription POST timeout. Long dictations (30 min+) take well over a minute on the NPU, so this
+# is generous; it only bounds a genuinely stuck/cold server.
+HTTP_TIMEOUT="${DICTATION_HTTP_TIMEOUT:-900}"
+# Best-effort start/stop chimes (freedesktop sounds, played via pw-record's sibling pw-play). @SOUNDS@
+# is the sound-theme-freedesktop store path, substituted at build time by default.nix.
+SOUNDS="${DICTATION_SOUNDS:-@SOUNDS@}"
+SND_START="${DICTATION_SND_START:-message.oga}"
+SND_STOP="${DICTATION_SND_STOP:-complete.oga}"
 
 note() { notify-send -t 5000 -a dictation "Dictation" "$1" 2>/dev/null || true; }
+
+# Audible cue, best-effort and non-blocking. setsid detaches it so it outlives this keybind process;
+# 9>&- keeps the detached player from inheriting/holding the single-instance lock (see fd 9 below).
+# Guarded on everything so a missing file/player/theme is a silent no-op, never an error.
+chime() {
+  [ -n "${DICTATION_NOSOUND:-}" ] && return 0
+  local f="$SOUNDS/$1"
+  [ -r "$f" ] || return 0
+  command -v pw-play >/dev/null 2>&1 || return 0
+  setsid pw-play "$f" >/dev/null 2>&1 9>&- &
+}
 
 # Resume exactly the media players we paused on START (see pause block below). Safe to call
 # on any STOP/cleanup path — a no-op if we paused nothing.
@@ -60,10 +84,10 @@ wrap() {
   local t="$1" cls="$2" mode="${DICTATION_WRAP:-auto}"
   case "$mode" in
     never)  printf '%s' "$t"; return ;;
-    always) printf '<dictated_note>\n%s\n</dictated_note>' "$t"; return ;;
+    always) printf '<dictation>\n%s\n</dictation>' "$t"; return ;;
   esac
   if is_terminal "$cls"; then
-    printf '<dictated_note>\n%s\n</dictated_note>' "$t"
+    printf '<dictation>\n%s\n</dictation>' "$t"
   else
     printf '%s' "$t"
   fi
@@ -83,7 +107,7 @@ deliver() {
   sleep 0.12 # let clipboard settle / focus stabilize
   if is_terminal "$cls"; then
     if wtype -M ctrl -M shift -k v -m shift -m ctrl 2>/dev/null; then
-      note "Pasted dictated_note -> $cls"
+      note "Pasted dictation -> $cls"
     else
       note "Copied (paste failed)"
     fi
@@ -111,12 +135,13 @@ if systemctl --user is-active --quiet "$UNIT"; then
   fi
   rm -f "$CARDF" "$PROFF"
   resume_players   # A2DP is back — resume whatever we paused, before the (slower) transcribe
+  chime "$SND_STOP"   # audible "recording stopped" — fires before the (slower) transcribe/paste
 
   if [ ! -s "$WAV" ] || [ "$(stat -c%s "$WAV" 2>/dev/null || echo 0)" -lt 4096 ]; then
     note "No audio captured (headset disconnected?)"
     exit 0
   fi
-  if ! json=$(curl --fail --max-time 60 -sS -H 'Content-Type: audio/wav' \
+  if ! json=$(curl --fail --max-time "$HTTP_TIMEOUT" -sS -H 'Content-Type: audio/wav' \
     --data-binary @"$WAV" -X POST "$URL"); then
     note "Transcription failed / server cold"
     exit 0
@@ -194,13 +219,19 @@ else
 fi
 
 # Record inside a transient user unit so it survives this process exiting. SIGINT on stop
-# finalizes the WAV; RuntimeMaxSec caps a forgotten recording. Absolute pw-record path so
-# the systemd user manager (different PATH) can find it.
+# finalizes the WAV. RuntimeMaxSec is only added when DICTATION_MAX_SECONDS is set — by default
+# there's no cap, because expiry kills the unit without running the STOP branch (audio is lost).
+# Absolute pw-record path so the systemd user manager (different PATH) can find it.
 pwrec=$(command -v pw-record)
 rm -f "$WAV"
 systemctl --user reset-failed "$UNIT" 2>/dev/null || true
-systemd-run --user --quiet --collect --unit="$UNIT" \
-  --property=KillSignal=SIGINT \
-  --property=RuntimeMaxSec="$MAX" \
+runargs=(--user --quiet --collect --unit="$UNIT" --property=KillSignal=SIGINT)
+[ -n "$MAX" ] && runargs+=(--property=RuntimeMaxSec="$MAX")
+systemd-run "${runargs[@]}" \
   -- "$pwrec" --target "$src" --rate 16000 --channels 1 --format s16 "$WAV"
-note "Recording... (SUPER+D to stop, ${MAX}s cap)"
+chime "$SND_START"   # audible "recording started"
+if [ -n "$MAX" ]; then
+  note "Recording... (toggle to stop, ${MAX}s cap)"
+else
+  note "Recording... (toggle to stop)"
+fi

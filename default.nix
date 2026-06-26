@@ -19,6 +19,7 @@
 , coreutils       # stat, cat, seq, mkdir, printf
 , gnused          # sed
 , gawk            # awk
+, sound-theme-freedesktop   # start/stop chime sounds (.oga), played via pw-play
 }:
 
 writeShellApplication {
@@ -27,5 +28,10 @@ writeShellApplication {
     pipewire wl-clipboard wtype jq curl libnotify
     pulseaudio playerctl hyprland util-linux systemd coreutils gnused gawk
   ];
-  text = builtins.readFile ./dictation-toggle.sh;
+  # Bake the sound-theme store path into the script (the @SOUNDS@ placeholder) so the chimes are
+  # hermetic — pw-play (from pipewire, already on PATH) reads the .oga files directly.
+  text = builtins.replaceStrings
+    [ "@SOUNDS@" ]
+    [ "${sound-theme-freedesktop}/share/sounds/freedesktop/stereo" ]
+    (builtins.readFile ./dictation-toggle.sh);
 }
