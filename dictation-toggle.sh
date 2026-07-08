@@ -39,6 +39,14 @@ SOUNDS="${DICTATION_SOUNDS:-@SOUNDS@}"
 SND_START="${DICTATION_SND_START:-message.oga}"
 SND_STOP="${DICTATION_SND_STOP:-complete.oga}"
 
+# Archive each finalized recording (audio + transcript) to a browsable, persistent dir so a
+# failed transcription never loses the audio (cliphist only keeps the resulting text, and the
+# live rec.wav lives in tmpfs and is clobbered every run). DICTATION_ARCHIVE=0 disables it;
+# DICTATION_ARCHIVE_DIR overrides the location. Pruning of files older than the retention window
+# is handled out-of-band by the dictation-prune systemd --user timer, not here.
+ARCHIVE="${DICTATION_ARCHIVE:-1}"
+ARCHIVE_DIR="${DICTATION_ARCHIVE_DIR:-$HOME/Recordings/Dictation}"
+
 note() { notify-send -t 5000 -a dictation "Dictation" "$1" 2>/dev/null || true; }
 
 # Audible cue, best-effort and non-blocking. setsid detaches it so it outlives this keybind process;
@@ -63,6 +71,25 @@ resume_players() {
     done <"$PLAYERSF"
   fi
   rm -f "$PLAYERSF"
+}
+
+# Archive the finalized recording to a persistent, browsable dir. Best-effort: archiving must
+# never block delivery. archive_wav() copies the audio and sets archive_base; archive_txt() then
+# drops the matching transcript (or a failure marker) alongside it, as:
+#   <ARCHIVE_DIR>/dictation-YYYYMMDD-HHMMSS.{wav,txt}
+archive_base=""
+archive_wav() {
+  [ "$ARCHIVE" = "0" ] && return 0
+  if ! mkdir -p "$ARCHIVE_DIR" 2>/dev/null; then
+    note "Archive dir unavailable: $ARCHIVE_DIR"
+    return 0
+  fi
+  archive_base="$ARCHIVE_DIR/dictation-$(date +%Y%m%d-%H%M%S)"
+  cp -- "$WAV" "$archive_base.wav" 2>/dev/null || archive_base=""
+}
+archive_txt() {
+  [ -n "$archive_base" ] || return 0
+  printf '%s\n' "$1" >"$archive_base.txt" 2>/dev/null || true
 }
 
 # Single-instance guard. CRITICAL: close fd 9 (`9>&-`) wherever we spawn a daemonizing
@@ -141,16 +168,22 @@ if systemctl --user is-active --quiet "$UNIT"; then
     note "No audio captured (headset disconnected?)"
     exit 0
   fi
+
+  archive_wav   # persist the audio now, before transcription — any failure past here keeps the .wav
+
   if ! json=$(curl --fail --max-time "$HTTP_TIMEOUT" -sS -H 'Content-Type: audio/wav' \
     --data-binary @"$WAV" -X POST "$URL"); then
-    note "Transcription failed / server cold"
+    archive_txt "[transcription failed — server cold/unreachable; audio saved to this .wav for manual re-run]"
+    note "Transcription failed / server cold (audio saved)"
     exit 0
   fi
   text=$(printf '%s' "$json" | jq -r '.text // empty' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
   if [ -z "$text" ]; then
+    archive_txt "[no transcript — empty/error response: $(printf '%s' "$json" | jq -r '.error // "empty"')]"
     note "No text ($(printf '%s' "$json" | jq -r '.error // "empty response"'))"
     exit 0
   fi
+  archive_txt "$text"
   deliver "$text"
   exit 0
 fi
