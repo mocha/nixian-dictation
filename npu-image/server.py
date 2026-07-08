@@ -24,6 +24,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DEVICE = os.environ.get("WHISPER_DEVICE", "NPU")
+# Trim leading/trailing silence before inference: Whisper emits phantom tokens on silence
+# (the classic "you"/"thank you" hallucinations) and transcribing it wastes NPU time. top_db is
+# the librosa threshold (dB below peak) treated as silence; WHISPER_TRIM_TOP_DB=0 disables it.
+TRIM_TOP_DB = int(os.environ.get("WHISPER_TRIM_TOP_DB", "35"))
 
 
 class ModelManager:
@@ -76,6 +80,10 @@ def transcribe_with_model(model_name):
         if not audio_data:
             return jsonify({"error": "No audio data"}), 400
         speech, _ = librosa.load(io.BytesIO(audio_data), sr=16000)
+        if TRIM_TOP_DB > 0 and speech.size:
+            trimmed, _ = librosa.effects.trim(speech, top_db=TRIM_TOP_DB)
+            if trimmed.size:  # keep the trim only if it left actual audio (not an all-silent clip)
+                speech = trimmed
         result = pipeline.generate(speech)
         return jsonify({"text": str(result)})
     except Exception as e:
