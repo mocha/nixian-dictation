@@ -43,6 +43,10 @@ RUN pip install --break-system-packages --no-cache-dir \
         openvino==2026.2.1 openvino-tokenizers==2026.2.1 openvino-genai==2026.2.1.0 \
         flask librosa soundfile
 
+# waitress in its own layer so adding it doesn't force a re-download of the large OpenVINO wheels
+# above. It's the production WSGI server (worker threads) we serve the Flask app through.
+RUN pip install --break-system-packages --no-cache-dir waitress
+
 # Default model the server pre-warms on the NPU at startup (must be a current OpenVINO
 # export — 2024-era IR fails the static NPU pipeline). The toggle script requests this same
 # name via /transcribe/<model>, so the first real dictation is instant.
