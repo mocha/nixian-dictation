@@ -19,6 +19,7 @@
 , coreutils       # stat, cat, seq, mkdir, printf
 , gnused          # sed
 , gawk            # awk
+, sox             # opt-in auto-stop recorder (records-until-trailing-silence via the `silence` effect)
 , sound-theme-freedesktop   # start/stop chime sounds (.oga), played via pw-play
 }:
 
@@ -26,7 +27,7 @@ writeShellApplication {
   name = "dictation-toggle";
   runtimeInputs = [
     pipewire wl-clipboard wtype jq curl libnotify
-    pulseaudio playerctl hyprland util-linux systemd coreutils gnused gawk
+    pulseaudio playerctl hyprland util-linux systemd coreutils gnused gawk sox
   ];
   # Bake the sound-theme store path into the script (the @SOUNDS@ placeholder) so the chimes are
   # hermetic — pw-play (from pipewire, already on PATH) reads the .oga files directly.

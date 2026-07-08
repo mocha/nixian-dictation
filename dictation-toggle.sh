@@ -15,7 +15,11 @@
 # Env overrides: DICTATION_MODEL, DICTATION_MAX_SECONDS (empty/0 = no cap, the default),
 #                DICTATION_HTTP_TIMEOUT (transcribe POST timeout, seconds), DICTATION_WRAP=auto|always|never,
 #                DICTATION_NOPASTE=1 (copy only), DICTATION_NOSOUND=1 (no start/stop chime),
-#                DICTATION_SOUNDS (sound dir), DICTATION_SND_START / DICTATION_SND_STOP (filenames).
+#                DICTATION_SOUNDS (sound dir), DICTATION_SND_START / DICTATION_SND_STOP (filenames),
+#                DICTATION_ARCHIVE=0 / DICTATION_ARCHIVE_DIR (recording retention; see below),
+#                DICTATION_AUTOSTOP_SILENCE=<seconds> (opt-in: end the recording after N seconds of
+#                  trailing silence, via sox; empty/0 = off, the default) + DICTATION_AUTOSTOP_THRESHOLD
+#                  (sox silence level, default 2%).
 
 DIR="${XDG_RUNTIME_DIR:-/tmp}/dictation"
 mkdir -p "$DIR"
@@ -46,6 +50,18 @@ SND_STOP="${DICTATION_SND_STOP:-complete.oga}"
 # is handled out-of-band by the dictation-prune systemd --user timer, not here.
 ARCHIVE="${DICTATION_ARCHIVE:-1}"
 ARCHIVE_DIR="${DICTATION_ARCHIVE_DIR:-$HOME/Recordings/Dictation}"
+
+# Opt-in auto-stop: when set to a positive number of seconds, record via sox (instead of pw-record)
+# and let it end the recording after that much trailing silence — then a detached watcher runs the
+# normal transcribe+paste. Empty/0 = off (default), because deliberate think-pauses shouldn't cut a
+# dictation short. THRESHOLD is the sox silence level (percent of full scale) for both leading-trim
+# and trailing-stop.
+AUTOSTOP="${DICTATION_AUTOSTOP_SILENCE:-}"
+# Silence threshold as an RMS amplitude (0..1): a 1s window below this counts as silence. Measured
+# on this hardware's Bluetooth capture: speech RMS ~0.05-0.45, silence floor ~0.0004 — so 0.005 sits
+# cleanly in the gap. Raise if a noisy room keeps it recording; lower if it stops while you're still
+# faintly talking.
+AUTOSTOP_RMS="${DICTATION_AUTOSTOP_THRESHOLD:-0.005}"
 
 note() { notify-send -t 5000 -a dictation "Dictation" "$1" 2>/dev/null || true; }
 
@@ -91,12 +107,6 @@ archive_txt() {
   [ -n "$archive_base" ] || return 0
   printf '%s\n' "$1" >"$archive_base.txt" 2>/dev/null || true
 }
-
-# Single-instance guard. CRITICAL: close fd 9 (`9>&-`) wherever we spawn a daemonizing
-# child — wl-copy forks and would otherwise inherit this fd and hold the lock forever,
-# silently wedging every later run. A racing double-press is told it's busy, not dropped.
-exec 9>"$DIR/lock"
-flock -n 9 || { note "Dictation busy (another run in progress)"; exit 0; }
 
 is_terminal() {
   case "$1" in
@@ -154,9 +164,11 @@ deliver() {
   esac
 }
 
-# ---- STOP branch: a recording is in flight --------------------------------
-if systemctl --user is-active --quiet "$UNIT"; then
-  systemctl --user stop "$UNIT" 2>/dev/null || true # KillSignal=SIGINT → clean WAV; blocks until exit
+# Finalize a just-ended recording: restore the BT profile, resume media, chime, then archive +
+# transcribe + paste. Called by the manual STOP branch (normal mode) and by the __watch process
+# (auto-stop mode). Assumes the recording unit is already stopped/inactive; returns (never exits)
+# so callers keep control of flow.
+finalize() {
   if [ -f "$CARDF" ] && [ -f "$PROFF" ] && [ -s "$PROFF" ]; then
     pactl set-card-profile "$(cat "$CARDF")" "$(cat "$PROFF")" 2>/dev/null || true
   fi
@@ -166,25 +178,76 @@ if systemctl --user is-active --quiet "$UNIT"; then
 
   if [ ! -s "$WAV" ] || [ "$(stat -c%s "$WAV" 2>/dev/null || echo 0)" -lt 4096 ]; then
     note "No audio captured (headset disconnected?)"
-    exit 0
+    return 0
   fi
 
   archive_wav   # persist the audio now, before transcription — any failure past here keeps the .wav
 
+  local json text
   if ! json=$(curl --fail --max-time "$HTTP_TIMEOUT" -sS -H 'Content-Type: audio/wav' \
     --data-binary @"$WAV" -X POST "$URL"); then
     archive_txt "[transcription failed — server cold/unreachable; audio saved to this .wav for manual re-run]"
     note "Transcription failed / server cold (audio saved)"
-    exit 0
+    return 0
   fi
   text=$(printf '%s' "$json" | jq -r '.text // empty' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
   if [ -z "$text" ]; then
     archive_txt "[no transcript — empty/error response: $(printf '%s' "$json" | jq -r '.error // "empty"')]"
     note "No text ($(printf '%s' "$json" | jq -r '.error // "empty response"'))"
-    exit 0
+    return 0
   fi
   archive_txt "$text"
   deliver "$text"
+}
+
+# ---- Auto-stop watcher (internal) -----------------------------------------
+# Launched detached (setsid) by the START branch when auto-stop is on. pw-record keeps writing the
+# WAV (the proven capture path); this watcher just polls the file's tail. Each second it reads the
+# last ~1s of PCM (tail bytes → sox raw `stat` for RMS) and, once speech has actually been heard,
+# stops the recording after AUTOSTOP seconds of continuous silence (RMS < AUTOSTOP_RMS). A manual
+# toggle ending the unit early just breaks the loop. Runs BEFORE the single-instance lock on purpose,
+# so a manual early-stop press isn't told "busy". sox here only analyzes a file — it never captures.
+if [ "${1:-}" = "__watch" ]; then
+  silent=0
+  heard=0
+  while systemctl --user is-active --quiet "$UNIT"; do
+    sleep 1
+    # last 1s of s16le mono 16k audio = 32000 bytes; interpret raw (skips the WAV-header question)
+    rms=$(tail -c 32000 "$WAV" 2>/dev/null \
+          | sox -t raw -r 16000 -e signed -b 16 -c 1 - -n stat 2>&1 \
+          | awk -F: '/RMS.*amplitude/{gsub(/ /,"",$2); print $2}')
+    [ -n "$rms" ] || continue
+    if awk -v r="$rms" -v t="$AUTOSTOP_RMS" 'BEGIN{exit !(r+0 < t+0)}'; then
+      silent=$((silent + 1))
+      if [ "$heard" = "1" ] && [ "$silent" -ge "$AUTOSTOP" ]; then
+        systemctl --user stop "$UNIT" 2>/dev/null || true   # trailing silence reached → end recording
+        break
+      fi
+    else
+      silent=0
+      heard=1   # only arm auto-stop after real speech, so the pre-talk pause never triggers it
+    fi
+  done
+  rm -f "$DIR/autostop"
+  finalize
+  exit 0
+fi
+
+# Single-instance guard. CRITICAL: close fd 9 (`9>&-`) wherever we spawn a daemonizing child —
+# wl-copy forks and would otherwise inherit this fd and hold the lock forever, silently wedging
+# every later run. A racing double-press is told it's busy, not dropped.
+exec 9>"$DIR/lock"
+flock -n 9 || { note "Dictation busy (another run in progress)"; exit 0; }
+
+# ---- STOP branch: a recording is in flight --------------------------------
+if systemctl --user is-active --quiet "$UNIT"; then
+  systemctl --user stop "$UNIT" 2>/dev/null || true # KillSignal=SIGINT → clean WAV; blocks until exit
+  if [ -f "$DIR/autostop" ]; then
+    # auto-stop mode: the detached watcher owns finalize (it's waiting for the unit to end). We only
+    # needed to end the recording early — the watcher will archive + transcribe + paste.
+    exit 0
+  fi
+  finalize
   exit 0
 fi
 
@@ -254,16 +317,30 @@ fi
 # Record inside a transient user unit so it survives this process exiting. SIGINT on stop
 # finalizes the WAV. RuntimeMaxSec is only added when DICTATION_MAX_SECONDS is set — by default
 # there's no cap, because expiry kills the unit without running the STOP branch (audio is lost).
-# Absolute pw-record path so the systemd user manager (different PATH) can find it.
-pwrec=$(command -v pw-record)
-rm -f "$WAV"
+# Absolute recorder paths so the systemd user manager (different PATH) can find them.
+rm -f "$WAV" "$DIR/autostop"
 systemctl --user reset-failed "$UNIT" 2>/dev/null || true
 runargs=(--user --quiet --collect --unit="$UNIT" --property=KillSignal=SIGINT)
 [ -n "$MAX" ] && runargs+=(--property=RuntimeMaxSec="$MAX")
+
+pwrec=$(command -v pw-record)
 systemd-run "${runargs[@]}" \
   -- "$pwrec" --target "$src" --rate 16000 --channels 1 --format s16 "$WAV"
+
+autostop_active=0
+if [ -n "$AUTOSTOP" ] && [ "$AUTOSTOP" != "0" ] && command -v sox >/dev/null 2>&1; then
+  # Auto-stop: same pw-record capture, plus a detached watcher that ends the recording after
+  # AUTOSTOP seconds of trailing silence (see the __watch block above). The marker tells a manual
+  # STOP press to defer to that watcher instead of finalizing itself. 9>&- keeps the detached
+  # watcher from inheriting/holding the single-instance lock.
+  : >"$DIR/autostop"
+  setsid "$0" __watch >/dev/null 2>&1 9>&- &
+  autostop_active=1
+fi
 chime "$SND_START"   # audible "recording started"
-if [ -n "$MAX" ]; then
+if [ "$autostop_active" = "1" ]; then
+  note "Recording... (auto-stop after ${AUTOSTOP}s silence, or toggle)"
+elif [ -n "$MAX" ]; then
   note "Recording... (toggle to stop, ${MAX}s cap)"
 else
   note "Recording... (toggle to stop)"
