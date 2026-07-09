@@ -7,7 +7,11 @@
 # Flow:
 #   START : force the active Bluetooth card to HFP/mSBC (16k mono == Whisper input), then
 #           record via pw-record inside a TRANSIENT systemd --user unit so the recording
-#           survives this keybind process exiting (you can roam between windows).
+#           survives this keybind process exiting (you can roam between windows). Once the
+#           unit is confirmed active, fire a detached POST to the server's /warm endpoint so a
+#           cold NPU pipeline compiles while you're still talking, not after you stop; then show
+#           a persistent "Recording..." notification (note_start) that stays up until you
+#           dismiss it or STOP replaces it with the outcome (note_done).
 #   STOP  : `systemctl --user stop` sends SIGINT (KillSignal) so pw-record finalizes the WAV
 #           and blocks until it exits; POST the WAV raw to the warm NPU server; copy the text;
 #           paste via the focused app's own paste shortcut; restore the previous BT profile.
@@ -32,9 +36,12 @@ CARDF="$DIR/card"
 PROFF="$DIR/prevprofile"
 PLAYERSF="$DIR/players"   # MPRIS players we paused on START, to resume on STOP
 WATCHF="$DIR/watch"       # marker: a detached __watch process owns finalize (streaming/auto-stop)
+NOTIFYIDF="$DIR/notify_id" # id of the persistent "Recording..." notification (see note_start/note_done)
 UNIT="dictation-rec"
 MODEL="${DICTATION_MODEL:-whisper-small.en-fp16-ov}"
-URL="http://127.0.0.1:8009/transcribe/$MODEL"
+BASE_URL="http://127.0.0.1:8009"
+URL="$BASE_URL/transcribe/$MODEL"
+WARM_URL="$BASE_URL/warm/$MODEL"
 # No recording cap by default: when RuntimeMaxSec fires it just kills the transient unit, so the
 # STOP branch (which POSTs the WAV + pastes) never runs and the audio is silently lost. Set
 # DICTATION_MAX_SECONDS=<seconds> to re-add a safety cap (with that same drop-on-expiry caveat).
@@ -91,6 +98,31 @@ stream_text=""      # accumulated per-segment transcripts (built up inside the _
 stream_failed=0     # a segment POST failed → finalize falls back to whole-WAV transcription
 
 note() { notify-send -t 5000 -a dictation "Dictation" "$1" 2>/dev/null || true; }
+
+# Persistent "recording in progress" notification: -t 0 means it never auto-expires, so it's a
+# clear, standing visual indicator until either the user dismisses it manually or note_done()
+# below replaces it with the actual outcome at STOP. -p prints the notification id, stashed so a
+# *different* process (the STOP branch, or the detached __watch) can replace the right one.
+note_start() {
+  local id
+  id=$(notify-send -t 0 -p -a dictation "Dictation" "$1" 2>/dev/null) || return 0
+  [ -n "$id" ] && printf '%s' "$id" >"$NOTIFYIDF"
+}
+
+# The concluding notification for a recording (delivered/failed/empty/etc). Replaces the
+# note_start() notification if it's still up (or starts a fresh one if the user already dismissed
+# it -- notify-send just creates a new notification for an unknown replace-id, same net effect),
+# then consumes the id so unrelated note() calls (busy, server-down, ...) never touch it.
+note_done() {
+  local id=""
+  [ -s "$NOTIFYIDF" ] && id=$(cat "$NOTIFYIDF" 2>/dev/null)
+  rm -f "$NOTIFYIDF"
+  if [ -n "$id" ]; then
+    notify-send -t 5000 -r "$id" -a dictation "Dictation" "$1" 2>/dev/null || note "$1"
+  else
+    note "$1"
+  fi
+}
 
 # Audible cue, best-effort and non-blocking. setsid detaches it so it outlives this keybind process;
 # 9>&- keeps the detached player from inheriting/holding the single-instance lock (see fd 9 below).
@@ -165,28 +197,28 @@ deliver() {
   out=$(wrap "$raw" "$cls")
   printf '%s' "$out" | wl-copy 9>&-   # 9>&- : don't let wl-copy's daemon inherit/hold the lock
   if [ -n "${DICTATION_NOPASTE:-}" ]; then
-    note "Copied (no-paste)"
+    note_done "Copied (no-paste)"
     return
   fi
   sleep 0.12 # let clipboard settle / focus stabilize
   if is_terminal "$cls"; then
     if wtype -M ctrl -M shift -k v -m shift -m ctrl 2>/dev/null; then
-      note "Pasted dictation -> $cls"
+      note_done "Pasted dictation -> $cls"
     else
-      note "Copied (paste failed)"
+      note_done "Copied (paste failed)"
     fi
     return
   fi
   case "$cls" in
     dev.zed.Zed | firefox | org.mozilla.firefox | chromium-browser | Google-chrome | obsidian | Slack | vesktop | discord)
       if wtype -M ctrl -k v -m ctrl 2>/dev/null; then
-        note "Pasted -> $cls"
+        note_done "Pasted -> $cls"
       else
-        note "Copied (paste failed)"
+        note_done "Copied (paste failed)"
       fi
       ;;
     *)
-      note "Copied to clipboard (paste manually -- ${cls:-unknown})"
+      note_done "Copied to clipboard (paste manually -- ${cls:-unknown})"
       ;;
   esac
 }
@@ -204,7 +236,7 @@ finalize() {
   chime "$SND_STOP"   # audible "recording stopped" — fires before the (slower) transcribe/paste
 
   if [ ! -s "$WAV" ] || [ "$(stat -c%s "$WAV" 2>/dev/null || echo 0)" -lt 4096 ]; then
-    note "No audio captured (headset disconnected?)"
+    note_done "No audio captured (headset disconnected?)"
     return 0
   fi
 
@@ -217,7 +249,7 @@ finalize() {
     text="$stream_text"
     if [ -z "$text" ]; then
       archive_txt "[no transcript — streaming produced no text]"
-      note "No text (stream empty)"
+      note_done "No text (stream empty)"
       return 0
     fi
   else
@@ -225,13 +257,13 @@ finalize() {
     if ! json=$(curl --fail --max-time "$HTTP_TIMEOUT" -sS -H 'Content-Type: audio/wav' \
       --data-binary @"$WAV" -X POST "$URL"); then
       archive_txt "[transcription failed — server cold/unreachable; audio saved to this .wav for manual re-run]"
-      note "Transcription failed / server cold (audio saved)"
+      note_done "Transcription failed / server cold (audio saved)"
       return 0
     fi
     text=$(printf '%s' "$json" | jq -r '.text // empty' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     if [ -z "$text" ]; then
       archive_txt "[no transcript — empty/error response: $(printf '%s' "$json" | jq -r '.error // "empty"')]"
-      note "No text ($(printf '%s' "$json" | jq -r '.error // "empty response"'))"
+      note_done "No text ($(printf '%s' "$json" | jq -r '.error // "empty response"'))"
       return 0
     fi
   fi
@@ -424,7 +456,7 @@ fi
 # finalizes the WAV. RuntimeMaxSec is only added when DICTATION_MAX_SECONDS is set — by default
 # there's no cap, because expiry kills the unit without running the STOP branch (audio is lost).
 # Absolute recorder paths so the systemd user manager (different PATH) can find them.
-rm -f "$WAV" "$WATCHF" "$DIR/seg.wav"
+rm -f "$WAV" "$WATCHF" "$DIR/seg.wav" "$NOTIFYIDF"
 systemctl --user reset-failed "$UNIT" 2>/dev/null || true
 runargs=(--user --quiet --collect --unit="$UNIT" --property=KillSignal=SIGINT)
 [ -n "$MAX" ] && runargs+=(--property=RuntimeMaxSec="$MAX")
@@ -432,6 +464,33 @@ runargs=(--user --quiet --collect --unit="$UNIT" --property=KillSignal=SIGINT)
 pwrec=$(command -v pw-record)
 systemd-run "${runargs[@]}" \
   -- "$pwrec" --target "$src" --rate 16000 --channels 1 --format s16 "$WAV"
+
+# systemd-run returns once the transient unit is *queued*, not once pw-record has actually opened
+# the device -- an invalid/vanished source fails inside the unit a beat later. Confirm it's really
+# active before telling the user recording started; otherwise this notified "Recording..." while
+# nothing was actually being captured (the tray icon already got this right, since it polls unit
+# state directly -- this closes the gap in the notification).
+started=0
+for _ in $(seq 1 20); do
+  systemctl --user is-active --quiet "$UNIT" && { started=1; break; }
+  sleep 0.05
+done
+if [ "$started" != "1" ]; then
+  if [ -f "$CARDF" ] && [ -s "$PROFF" ]; then
+    pactl set-card-profile "$(cat "$CARDF")" "$(cat "$PROFF")" 2>/dev/null || true
+  fi
+  resume_players
+  rm -f "$CARDF" "$PROFF"
+  note "Recording failed to start (mic unavailable?)"
+  exit 1
+fi
+
+# Kick the NPU model warm the moment recording actually begins -- not at STOP -- so a cold
+# pipeline (first dictation after boot/suspend; see server.py's /warm) gets the whole length of
+# the dictation as a head start instead of making STOP wait for it. Best-effort and detached:
+# 9>&- keeps it from holding the instance lock; if this fails, the real transcribe POST at STOP
+# just pays the cold-load cost like before.
+setsid curl -fsS --max-time "$HTTP_TIMEOUT" -X POST "$WARM_URL" >/dev/null 2>&1 9>&- &
 
 watch_active=0
 if command -v sox >/dev/null 2>&1 \
@@ -448,11 +507,11 @@ chime "$SND_START"   # audible "recording started"
 autostop_note=""
 [ "$watch_active" = "1" ] && [ -n "$AUTOSTOP" ] && [ "$AUTOSTOP" != "0" ] && autostop_note="auto-stop after ${AUTOSTOP}s silence, "
 if [ "$watch_active" = "1" ] && [ "$STREAM" = "1" ]; then
-  note "Recording... (live transcribe; ${autostop_note}toggle to stop)"
+  note_start "Recording... (live transcribe; ${autostop_note}toggle to stop)"
 elif [ -n "$autostop_note" ]; then
-  note "Recording... (${autostop_note}or toggle)"
+  note_start "Recording... (${autostop_note}or toggle)"
 elif [ -n "$MAX" ]; then
-  note "Recording... (toggle to stop, ${MAX}s cap)"
+  note_start "Recording... (toggle to stop, ${MAX}s cap)"
 else
-  note "Recording... (toggle to stop)"
+  note_start "Recording... (toggle to stop)"
 fi

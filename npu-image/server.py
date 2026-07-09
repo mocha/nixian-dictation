@@ -9,11 +9,14 @@ Changes from upstream:
   - adds GET /health -> {devices, loaded, default, requested_device}
   - adds POST /v1/audio/transcriptions (OpenAI-compatible: multipart `file` + `model` +
     `response_format`) so any OpenAI SDK/tool can drive this NPU server
+  - adds POST /warm[/<model>]: force-load a model with no audio, so a client can trigger the
+    (~30s cold) compile ahead of the real transcribe call instead of eating that latency at it
   - inference is serialized by a lock (one NPU WhisperPipeline can't run concurrent generate()s)
     and served by waitress with worker threads, so /health stays responsive even while a slow
     model-load or transcription holds the lock
 API: POST /transcribe[/<model>] with a RAW audio body -> {"text": ...} | {"error": ...}
      POST /v1/audio/transcriptions (multipart) -> OpenAI transcription response
+     POST /warm[/<model>] -> {"warm": true, "model": ...} | {"error": ...}
 """
 import io
 import os
@@ -97,6 +100,28 @@ def health():
 @app.route("/models", methods=["GET"])
 def list_models():
     return jsonify({"models": model_manager.list_models()})
+
+
+@app.route("/warm/<model_name>", methods=["POST"])
+def warm_model(model_name):
+    """Force-load (or confirm already-loaded) a model without transcribing anything. Callers fire
+    this the moment a dictation *starts* so a cold pipeline (first call after boot, or after an
+    NPU-resetting suspend/resume) compiles while the user is still talking, instead of the
+    transcribe POST at stop paying that cost."""
+    try:
+        with _infer_lock:
+            model_manager.load_model(model_name)
+        return jsonify({"warm": True, "model": model_name})
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        logger.error("Error (warm): %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/warm", methods=["POST"])
+def warm_default():
+    return warm_model(model_manager.default_model)
 
 
 @app.route("/transcribe/<model_name>", methods=["POST"])

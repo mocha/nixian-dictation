@@ -70,6 +70,28 @@ mutually-compatible stack:
 - **Security:** server binds `127.0.0.1:8009` only (not on LAN). A Unix-socket hardening was
   offered (eliminates the TCP surface) — still open / undecided.
 
+### Session-3 additions (start-failure notification, cold-start latency, persistent recording note)
+- **Fixed false "Recording..." notification:** `systemd-run` returns once the transient unit is
+  *queued*, not once `pw-record` has actually opened the device — an invalid/vanished source
+  failed inside the unit a beat later while the script still reported success (the bar icon,
+  which polls unit state directly, already got this right). START now polls `is-active` (up to
+  ~1s) before notifying; on failure it restores the BT profile/resumes players and reports
+  "Recording failed to start (mic unavailable?)" instead.
+- **Cold-start latency:** the NPU model is already kept warm indefinitely (container never
+  evicts it — see `ModelManager.pipelines`; host-side cgroup usage is ~33 MB, trivial, and
+  nothing else on this box touches the NPU, so there's no reason not to). The real ~30s cold
+  hit only happens once per container start (boot/login) or after anything that resets the NPU
+  (e.g. suspend/resume). Added `POST /warm[/<model>]` to `server.py` (force-loads a model, no
+  audio needed) and have `dictation-toggle` fire it detached the moment recording is confirmed
+  started — so a cold pipeline compiles while the user is still talking instead of at STOP.
+  **Requires an image rebuild + `systemctl --user restart whisper-npu`** to take effect (`server.py`
+  is `COPY`'d into the image, not bind-mounted).
+- **Persistent recording notification:** the "Recording..." toast used to auto-expire after 5s.
+  It's now sent with `notify-send -t 0 -p` (never expires; id captured) via `note_start`, and
+  replaced with the actual outcome (pasted/copied/failed/etc.) via `note_done` using
+  `-r <id>` when the recording ends — so it's a standing visual indicator the whole time you're
+  dictating, gone only once you dismiss it or the recording concludes.
+
 ### Known follow-ups
 - **Bluetooth stability:** the WH-1000XM5 audio link drops intermittently (Sony multipoint) — the
   most common real-world failure; not a tool bug.
