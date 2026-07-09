@@ -421,10 +421,13 @@ if [ -n "${card:-}" ]; then
     pactl set-card-profile "$card" headset-head-unit 2>/dev/null || true
 
   # the source bound to THIS card shares its MAC: bluez_card.<MAC> → bluez_input.<MAC>*
+  # Match as a PREFIX (index==1), not "contains the mac anywhere" -- a plain substring check
+  # can also match this same card's bluez_output.<MAC>.*.monitor (the sink's loopback monitor,
+  # not a mic), and pw-record against a monitor either records silence or nothing at all.
   mac=${card#bluez_card.}
   src=""
   for _ in $(seq 1 30); do
-    src=$(pactl list short sources | awk -v m="$mac" 'index($2, m){print $2; exit}')
+    src=$(pactl list short sources | awk -v m="bluez_input.$mac" 'index($2, m)==1{print $2; exit}')
     [ -n "$src" ] && break
     sleep 0.1
   done
@@ -450,6 +453,14 @@ else
       note "No usable mic (internal mic is dead — connect a headset or USB mic)"
       exit 1 ;;
   esac
+  # pactl can report the "@DEFAULT_SOURCE@" placeholder even when nothing is actually
+  # configured (no explicit default and WirePlumber has nothing to offer) -- pw-record can't
+  # bind that to a real node ("no target node available") and dies instantly. Confirm at least
+  # one real, non-monitor source exists before trusting $src.
+  if ! pactl list short sources | awk '$2 !~ /\.monitor$/{f=1} END{exit !f}'; then
+    note "No microphone available"
+    exit 1
+  fi
 fi
 
 # Record inside a transient user unit so it survives this process exiting. SIGINT on stop
@@ -475,6 +486,14 @@ for _ in $(seq 1 20); do
   systemctl --user is-active --quiet "$UNIT" && { started=1; break; }
   sleep 0.05
 done
+# The unit flips to "active" the instant pw-record is forked -- well before it finishes
+# connecting to PipeWire and can discover the target node doesn't exist. That failure lands a
+# beat later (observed: same tick, well under a second), so re-confirm it's *still* active after
+# a short settle window; otherwise a unit that's already dying still reads as a clean start.
+if [ "$started" = "1" ]; then
+  sleep 0.3
+  systemctl --user is-active --quiet "$UNIT" || started=0
+fi
 if [ "$started" != "1" ]; then
   if [ -f "$CARDF" ] && [ -s "$PROFF" ]; then
     pactl set-card-profile "$(cat "$CARDF")" "$(cat "$PROFF")" 2>/dev/null || true
