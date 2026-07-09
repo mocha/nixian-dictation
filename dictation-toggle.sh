@@ -18,8 +18,12 @@
 #                DICTATION_SOUNDS (sound dir), DICTATION_SND_START / DICTATION_SND_STOP (filenames),
 #                DICTATION_ARCHIVE=0 / DICTATION_ARCHIVE_DIR (recording retention; see below),
 #                DICTATION_AUTOSTOP_SILENCE=<seconds> (opt-in: end the recording after N seconds of
-#                  trailing silence, via sox; empty/0 = off, the default) + DICTATION_AUTOSTOP_THRESHOLD
-#                  (sox silence level, default 2%).
+#                  trailing silence; empty/0 = off, the default) + DICTATION_AUTOSTOP_THRESHOLD
+#                  (silence RMS threshold 0..1, default 0.005),
+#                DICTATION_STREAM=1 (opt-in: transcribe long dictations in chunks as you speak, for
+#                  near-instant paste at stop; default off) + DICTATION_STREAM_CHUNK (target segment
+#                  seconds, default 30), DICTATION_STREAM_MAXCHUNK (hard cap, default 45),
+#                  DICTATION_STREAM_QUIET (snap-to-quiet RMS threshold, default 0.05).
 
 DIR="${XDG_RUNTIME_DIR:-/tmp}/dictation"
 mkdir -p "$DIR"
@@ -27,6 +31,7 @@ WAV="$DIR/rec.wav"
 CARDF="$DIR/card"
 PROFF="$DIR/prevprofile"
 PLAYERSF="$DIR/players"   # MPRIS players we paused on START, to resume on STOP
+WATCHF="$DIR/watch"       # marker: a detached __watch process owns finalize (streaming/auto-stop)
 UNIT="dictation-rec"
 MODEL="${DICTATION_MODEL:-whisper-small.en-fp16-ov}"
 URL="http://127.0.0.1:8009/transcribe/$MODEL"
@@ -62,6 +67,28 @@ AUTOSTOP="${DICTATION_AUTOSTOP_SILENCE:-}"
 # cleanly in the gap. Raise if a noisy room keeps it recording; lower if it stops while you're still
 # faintly talking.
 AUTOSTOP_RMS="${DICTATION_AUTOSTOP_THRESHOLD:-0.005}"
+
+# Opt-in live streaming: while you dictate, transcribe the audio in chunks as it accumulates so the
+# final paste is near-instant on long dictations (short clips are already sub-second — this only pays
+# off as clips grow). DICTATION_STREAM=1 enables it (default off); independent of auto-stop, and when
+# either is on a detached __watch process owns finalize.
+#
+# Chunking is TIME-BASED, snapped to the quietest nearby moment — NOT pure silence detection. (A
+# corpus of real dictation showed silence gaps are too unreliable to cut on: some recordings pause
+# every ~20s, others never go quiet for 2s at all. But a low-energy dip is almost always available
+# within a few seconds of any point, so snapping a time-based cut to the local RMS minimum lands
+# clean boundaries without depending on the speaker to pause.) A segment closes once it reaches
+# STREAM_CHUNK seconds AND the current 1s window is "quiet" (RMS < STREAM_QUIET); if no quiet window
+# appears by STREAM_MAXCHUNK seconds, it force-cuts at the quietest window seen since STREAM_CHUNK.
+# On any per-segment POST failure the watcher falls back to transcribing the whole WAV at stop, so
+# streaming is a pure latency win that can't lose words.
+STREAM="${DICTATION_STREAM:-0}"
+STREAM_CHUNK="${DICTATION_STREAM_CHUNK:-30}"       # target segment length (s) before seeking a cut
+STREAM_MAXCHUNK="${DICTATION_STREAM_MAXCHUNK:-45}" # hard cap (s): force a cut even if nothing quieted
+STREAM_QUIET="${DICTATION_STREAM_QUIET:-0.05}"     # RMS below which a 1s window is a snap-able dip
+streamed=0          # set by the __watch process only when it actually streamed segments
+stream_text=""      # accumulated per-segment transcripts (built up inside the __watch process)
+stream_failed=0     # a segment POST failed → finalize falls back to whole-WAV transcription
 
 note() { notify-send -t 5000 -a dictation "Dictation" "$1" 2>/dev/null || true; }
 
@@ -184,20 +211,61 @@ finalize() {
   archive_wav   # persist the audio now, before transcription — any failure past here keeps the .wav
 
   local json text
-  if ! json=$(curl --fail --max-time "$HTTP_TIMEOUT" -sS -H 'Content-Type: audio/wav' \
-    --data-binary @"$WAV" -X POST "$URL"); then
-    archive_txt "[transcription failed — server cold/unreachable; audio saved to this .wav for manual re-run]"
-    note "Transcription failed / server cold (audio saved)"
-    return 0
-  fi
-  text=$(printf '%s' "$json" | jq -r '.text // empty' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-  if [ -z "$text" ]; then
-    archive_txt "[no transcript — empty/error response: $(printf '%s' "$json" | jq -r '.error // "empty"')]"
-    note "No text ($(printf '%s' "$json" | jq -r '.error // "empty response"'))"
-    return 0
+  if [ "$streamed" = "1" ] && [ "$stream_failed" = "0" ]; then
+    # Streaming succeeded: segments were transcribed live as they closed. Deliver the stitched
+    # result — no whole-WAV POST needed, so the paste is near-instant.
+    text="$stream_text"
+    if [ -z "$text" ]; then
+      archive_txt "[no transcript — streaming produced no text]"
+      note "No text (stream empty)"
+      return 0
+    fi
+  else
+    # Normal mode, or streaming that hit a failed segment: transcribe the whole WAV in one shot.
+    if ! json=$(curl --fail --max-time "$HTTP_TIMEOUT" -sS -H 'Content-Type: audio/wav' \
+      --data-binary @"$WAV" -X POST "$URL"); then
+      archive_txt "[transcription failed — server cold/unreachable; audio saved to this .wav for manual re-run]"
+      note "Transcription failed / server cold (audio saved)"
+      return 0
+    fi
+    text=$(printf '%s' "$json" | jq -r '.text // empty' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$text" ]; then
+      archive_txt "[no transcript — empty/error response: $(printf '%s' "$json" | jq -r '.error // "empty"')]"
+      note "No text ($(printf '%s' "$json" | jq -r '.error // "empty response"'))"
+      return 0
+    fi
   fi
   archive_txt "$text"
   deliver "$text"
+}
+
+# Transcribe one closed speech segment [start,end) of the growing WAV and append it to stream_text.
+# Runs inside the detached __watch process (streaming mode). Slices the raw PCM byte range — the file
+# only grows and this range is already written, so reading it while pw-record still appends is safe —
+# wraps it as a WAV via sox, and POSTs it to the warm NPU exactly like a full recording (the server's
+# front-trim strips the slice's leading/trailing silence). Any failure sets stream_failed so finalize
+# falls back to transcribing the whole WAV; streaming never drops words.
+flush_segment() {
+  local start="$1" end="$2"
+  local len=$((end - start)) seg json text
+  [ "$len" -gt 4096 ] || return 0   # skip sub-~128ms slivers — not worth a round-trip
+  seg="$DIR/seg.wav"
+  # dd (not tail|head) reads exactly [start,start+len) — its byte-granular skip/count avoids the
+  # SIGPIPE that head's early close would raise on tail, which pipefail would misread as a failure.
+  if ! dd if="$WAV" bs=1M skip="$start" count="$len" iflag=skip_bytes,count_bytes 2>/dev/null \
+       | sox -t raw -r 16000 -e signed -b 16 -c 1 - -t wav "$seg" 2>/dev/null; then
+    stream_failed=1
+    return 0
+  fi
+  if ! json=$(curl --fail --max-time "$HTTP_TIMEOUT" -sS -H 'Content-Type: audio/wav' \
+       --data-binary @"$seg" -X POST "$URL" 2>/dev/null); then
+    stream_failed=1
+    rm -f "$seg"
+    return 0
+  fi
+  rm -f "$seg"
+  text=$(printf '%s' "$json" | jq -r '.text // empty' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [ -n "$text" ] && stream_text="${stream_text:+$stream_text }$text"
 }
 
 # ---- Auto-stop watcher (internal) -----------------------------------------
@@ -208,27 +276,65 @@ finalize() {
 # toggle ending the unit early just breaks the loop. Runs BEFORE the single-instance lock on purpose,
 # so a manual early-stop press isn't told "busy". sox here only analyzes a file — it never captures.
 if [ "${1:-}" = "__watch" ]; then
-  silent=0
-  heard=0
+  autostop_on=0
+  { [ -n "$AUTOSTOP" ] && [ "$AUTOSTOP" != "0" ]; } && autostop_on=1
+  [ "$STREAM" = "1" ] && streamed=1   # tells finalize (in THIS process) to deliver the stitched text
+  cut=44          # first unflushed byte; 44 = canonical WAV header (PCM data starts here)
+  sil=0           # consecutive silent ticks (drives auto-stop)
+  heard=0         # armed once real speech is seen (so a pre-talk pause never auto-stops)
+  seg_active=0    # speech has occurred since the last cut (don't POST a silence-only segment)
+  cand_sz=0       # byte offset of the quietest 1s window seen since this segment hit STREAM_CHUNK,
+  cand_rms=""     #   with its RMS — the fallback cut point if none drops below STREAM_QUIET
+  chunk_b=$((STREAM_CHUNK * 32000))
+  max_b=$((STREAM_MAXCHUNK * 32000))
   while systemctl --user is-active --quiet "$UNIT"; do
     sleep 1
+    sz=$(stat -c%s "$WAV" 2>/dev/null || echo "$cut")
     # last 1s of s16le mono 16k audio = 32000 bytes; interpret raw (skips the WAV-header question)
     rms=$(tail -c 32000 "$WAV" 2>/dev/null \
           | sox -t raw -r 16000 -e signed -b 16 -c 1 - -n stat 2>&1 \
           | awk -F: '/RMS.*amplitude/{gsub(/ /,"",$2); print $2}')
     [ -n "$rms" ] || continue
     if awk -v r="$rms" -v t="$AUTOSTOP_RMS" 'BEGIN{exit !(r+0 < t+0)}'; then
-      silent=$((silent + 1))
-      if [ "$heard" = "1" ] && [ "$silent" -ge "$AUTOSTOP" ]; then
-        systemctl --user stop "$UNIT" 2>/dev/null || true   # trailing silence reached → end recording
-        break
-      fi
+      sil=$((sil + 1))
     else
-      silent=0
-      heard=1   # only arm auto-stop after real speech, so the pre-talk pause never triggers it
+      sil=0
+      heard=1       # only arm auto-stop after real speech, so the pre-talk pause never triggers it
+      seg_active=1
+    fi
+    # streaming: once a segment reaches STREAM_CHUNK, cut at the next quiet window — or, at the
+    # STREAM_MAXCHUNK cap, at the quietest window seen so far. Contiguous byte offsets ([cut,cutat))
+    # mean every byte lands in exactly one segment — no words lost, no overlap/duplication.
+    if [ "$STREAM" = "1" ] && [ "$seg_active" = "1" ] && [ "$((sz - cut))" -ge "$chunk_b" ]; then
+      if [ "$cand_sz" = "0" ] || awk -v r="$rms" -v c="$cand_rms" 'BEGIN{exit !(r+0 < c+0)}'; then
+        cand_rms="$rms"; cand_sz="$sz"
+      fi
+      cutat=0
+      if awk -v r="$rms" -v t="$STREAM_QUIET" 'BEGIN{exit !(r+0 < t+0)}'; then
+        cutat="$sz"        # quiet enough → cut here; nothing carries into the next segment
+      elif [ "$((sz - cut))" -ge "$max_b" ]; then
+        cutat="$cand_sz"   # forced cut → the quietest window seen (audio after it carries over)
+      fi
+      if [ "$cutat" != "0" ]; then
+        flush_segment "$cut" "$((cutat - cut))"
+        cut="$cutat"; cand_sz=0; cand_rms=""
+        [ "$cutat" -ge "$sz" ] && seg_active=0   # cut at "now" → wait for fresh speech
+      fi
+    fi
+    # auto-stop: end the whole recording after the (longer) trailing-silence window
+    if [ "$autostop_on" = "1" ] && [ "$heard" = "1" ] && [ "$sil" -ge "$AUTOSTOP" ]; then
+      systemctl --user stop "$UNIT" 2>/dev/null || true   # trailing silence reached → end recording
+      break
     fi
   done
-  rm -f "$DIR/autostop"
+  # The unit may still be finalizing the WAV (a manual stop ends it out from under this loop); a
+  # blocking stop guarantees pw-record has flushed the tail before we read it for the last segment.
+  systemctl --user stop "$UNIT" 2>/dev/null || true
+  if [ "$STREAM" = "1" ] && [ "$seg_active" = "1" ]; then
+    sz=$(stat -c%s "$WAV" 2>/dev/null || echo "$cut")
+    flush_segment "$cut" "$sz"   # trailing segment: speech that never hit a closing gap
+  fi
+  rm -f "$WATCHF" "$DIR/seg.wav"
   finalize
   exit 0
 fi
@@ -242,9 +348,9 @@ flock -n 9 || { note "Dictation busy (another run in progress)"; exit 0; }
 # ---- STOP branch: a recording is in flight --------------------------------
 if systemctl --user is-active --quiet "$UNIT"; then
   systemctl --user stop "$UNIT" 2>/dev/null || true # KillSignal=SIGINT → clean WAV; blocks until exit
-  if [ -f "$DIR/autostop" ]; then
-    # auto-stop mode: the detached watcher owns finalize (it's waiting for the unit to end). We only
-    # needed to end the recording early — the watcher will archive + transcribe + paste.
+  if [ -f "$WATCHF" ]; then
+    # streaming/auto-stop mode: the detached watcher owns finalize (it's waiting for the unit to end).
+    # We only needed to end the recording early — the watcher will flush + archive + transcribe + paste.
     exit 0
   fi
   finalize
@@ -318,7 +424,7 @@ fi
 # finalizes the WAV. RuntimeMaxSec is only added when DICTATION_MAX_SECONDS is set — by default
 # there's no cap, because expiry kills the unit without running the STOP branch (audio is lost).
 # Absolute recorder paths so the systemd user manager (different PATH) can find them.
-rm -f "$WAV" "$DIR/autostop"
+rm -f "$WAV" "$WATCHF" "$DIR/seg.wav"
 systemctl --user reset-failed "$UNIT" 2>/dev/null || true
 runargs=(--user --quiet --collect --unit="$UNIT" --property=KillSignal=SIGINT)
 [ -n "$MAX" ] && runargs+=(--property=RuntimeMaxSec="$MAX")
@@ -327,19 +433,24 @@ pwrec=$(command -v pw-record)
 systemd-run "${runargs[@]}" \
   -- "$pwrec" --target "$src" --rate 16000 --channels 1 --format s16 "$WAV"
 
-autostop_active=0
-if [ -n "$AUTOSTOP" ] && [ "$AUTOSTOP" != "0" ] && command -v sox >/dev/null 2>&1; then
-  # Auto-stop: same pw-record capture, plus a detached watcher that ends the recording after
-  # AUTOSTOP seconds of trailing silence (see the __watch block above). The marker tells a manual
-  # STOP press to defer to that watcher instead of finalizing itself. 9>&- keeps the detached
-  # watcher from inheriting/holding the single-instance lock.
-  : >"$DIR/autostop"
+watch_active=0
+if command -v sox >/dev/null 2>&1 \
+   && { [ "$STREAM" = "1" ] || { [ -n "$AUTOSTOP" ] && [ "$AUTOSTOP" != "0" ]; }; }; then
+  # Streaming and/or auto-stop both need the detached watcher: it polls rec.wav's tail once/sec,
+  # closes speech segments for live transcription (streaming), and/or ends the recording after
+  # trailing silence (auto-stop). The marker tells a manual STOP press to defer to that watcher
+  # instead of finalizing itself. 9>&- keeps the detached watcher from holding the instance lock.
+  : >"$WATCHF"
   setsid "$0" __watch >/dev/null 2>&1 9>&- &
-  autostop_active=1
+  watch_active=1
 fi
 chime "$SND_START"   # audible "recording started"
-if [ "$autostop_active" = "1" ]; then
-  note "Recording... (auto-stop after ${AUTOSTOP}s silence, or toggle)"
+autostop_note=""
+[ "$watch_active" = "1" ] && [ -n "$AUTOSTOP" ] && [ "$AUTOSTOP" != "0" ] && autostop_note="auto-stop after ${AUTOSTOP}s silence, "
+if [ "$watch_active" = "1" ] && [ "$STREAM" = "1" ]; then
+  note "Recording... (live transcribe; ${autostop_note}toggle to stop)"
+elif [ -n "$autostop_note" ]; then
+  note "Recording... (${autostop_note}or toggle)"
 elif [ -n "$MAX" ]; then
   note "Recording... (toggle to stop, ${MAX}s cap)"
 else
