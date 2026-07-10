@@ -91,6 +91,25 @@ mutually-compatible stack:
   replaced with the actual outcome (pasted/copied/failed/etc.) via `note_done` using
   `-r <id>` when the recording ends — so it's a standing visual indicator the whole time you're
   dictating, gone only once you dismiss it or the recording concludes.
+- **Fixed mic-source mis-selection, in two rounds:** first found that the BT source match was a
+  substring check on the MAC, so it could match this same card's `bluez_output.<MAC>.*.monitor`
+  (the sink's loopback, not a mic) instead of `bluez_input.<MAC>` — every real dictation before
+  this was almost certainly transcribing the *output* loopback, not the microphone. Switched to
+  a prefix match on `bluez_input.` — but the soundcore Liberty 4 Pro exposes that source as
+  `bluez_input.F4:9D:8A:79:5A:74` (colon-separated), while the card name and its own
+  `bluez_output` monitor both use underscores (`bluez_card.F4_9D_8A_79_5A_74`) — so the naive
+  prefix match on the raw (underscore) MAC never matched at all ("HFP mic did not come up"
+  every time). Fixed by stripping `_`/`:` from both sides before comparing. Also hardened the
+  non-Bluetooth path: `pactl get-default-source` can report the literal `@DEFAULT_SOURCE@`
+  placeholder with no real node behind it, which `pw-record` fails on instantly
+  ("no target node available") — now verified against an actual non-monitor source first.
+- **Fixed a start-check race:** a transient `systemd-run` unit reads "active" the instant
+  `pw-record` is forked, before it's finished connecting to PipeWire and can discover the
+  target doesn't exist -- so the fix above (poll `is-active` before notifying "Recording...")
+  still raced a fast failure. A failed unit dying in under a second also meant the *next*
+  toggle press found nothing active and was read as a fresh START instead of STOP, so every
+  press just launched another doomed recording (looked like recording "never stopped"). Added
+  a 0.3s settle + recheck after the unit first reports active.
 
 ### Known follow-ups
 - **Bluetooth stability:** the WH-1000XM5 audio link drops intermittently (Sony multipoint) — the

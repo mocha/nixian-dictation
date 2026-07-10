@@ -421,13 +421,22 @@ if [ -n "${card:-}" ]; then
     pactl set-card-profile "$card" headset-head-unit 2>/dev/null || true
 
   # the source bound to THIS card shares its MAC: bluez_card.<MAC> → bluez_input.<MAC>*
-  # Match as a PREFIX (index==1), not "contains the mac anywhere" -- a plain substring check
-  # can also match this same card's bluez_output.<MAC>.*.monitor (the sink's loopback monitor,
-  # not a mic), and pw-record against a monitor either records silence or nothing at all.
+  # Match on the *prefix* "bluez_input." (not "contains the mac anywhere") so this can never
+  # match this same card's bluez_output.<MAC>.*.monitor (the sink's loopback, not a mic) --
+  # and normalize separators before comparing the MAC itself: the card name always uses
+  # underscores (bluez_card.F4_9D_8A_79_5A_74), but depending on the adapter/headset WirePlumber
+  # can name the actual input source with colons (bluez_input.F4:9D:8A:79:5A:74) instead --
+  # a plain string-equality match on the raw MAC silently never matches on those devices.
   mac=${card#bluez_card.}
+  mac_norm=$(printf '%s' "$mac" | tr -d '_:')
   src=""
   for _ in $(seq 1 30); do
-    src=$(pactl list short sources | awk -v m="bluez_input.$mac" 'index($2, m)==1{print $2; exit}')
+    src=$(pactl list short sources | awk -v mn="$mac_norm" '
+      index($2, "bluez_input.") == 1 {
+        rest = substr($2, length("bluez_input.") + 1)
+        gsub(/[_:]/, "", rest)
+        if (index(rest, mn) == 1) { print $2; exit }
+      }')
     [ -n "$src" ] && break
     sleep 0.1
   done
