@@ -38,8 +38,12 @@ PLAYERSF="$DIR/players"   # MPRIS players we paused on START, to resume on STOP
 WATCHF="$DIR/watch"       # marker: a detached __watch process owns finalize (streaming/auto-stop)
 NOTIFYIDF="$DIR/notify_id" # id of the persistent "Recording..." notification (see note_start/note_done)
 UNIT="dictation-rec"
-MODEL="${DICTATION_MODEL:-whisper-small.en-fp16-ov}"
-BASE_URL="http://127.0.0.1:8009"
+MODEL="${DICTATION_MODEL:-@MODEL@}"
+# systemd --user unit that runs the transcription server (checked before we start recording).
+# Nixian: whisper-npu (OpenVINO NPU container). Dynamo: dictation-whisper (faster-whisper/CUDA).
+# Baked per host by nix/package.nix; DICTATION_SERVER_UNIT overrides.
+SERVER_UNIT="${DICTATION_SERVER_UNIT:-@SERVER_UNIT@}"
+BASE_URL="${DICTATION_BASE_URL:-http://127.0.0.1:@PORT@}"
 URL="$BASE_URL/transcribe/$MODEL"
 WARM_URL="$BASE_URL/warm/$MODEL"
 # No recording cap by default: when RuntimeMaxSec fires it just kills the transient unit, so the
@@ -52,8 +56,9 @@ HTTP_TIMEOUT="${DICTATION_HTTP_TIMEOUT:-900}"
 # Best-effort start/stop chimes (freedesktop sounds, played via pw-record's sibling pw-play). @SOUNDS@
 # is the sound-theme-freedesktop store path, substituted at build time by default.nix.
 SOUNDS="${DICTATION_SOUNDS:-@SOUNDS@}"
-SND_START="${DICTATION_SND_START:-message.oga}"
-SND_STOP="${DICTATION_SND_STOP:-complete.oga}"
+SND_START="${DICTATION_SND_START:-start.mp3}"   # recording began
+SND_STOP="${DICTATION_SND_STOP:-done.mp3}"      # transcription delivered (success)
+SND_FAIL="${DICTATION_SND_FAIL:-fail.mp3}"      # recording/transcription failed
 
 # Archive each finalized recording (audio + transcript) to a browsable, persistent dir so a
 # failed transcription never loses the audio (cliphist only keeps the resulting text, and the
@@ -97,7 +102,17 @@ streamed=0          # set by the __watch process only when it actually streamed 
 stream_text=""      # accumulated per-segment transcripts (built up inside the __watch process)
 stream_failed=0     # a segment POST failed → finalize falls back to whole-WAV transcription
 
+# Desktop adapter (the only desktop-specific seam): defines desktop_active_class() and
+# desktop_paste(). Inlined at build time per host by nix/package.nix in place of the marker below
+# — hyprland (wtype/hyprctl) on Nixian, kde (dotool/kdotool) on Dynamo. See lib/desktop-*.sh.
+# @DESKTOP_LIB@
+
 note() { notify-send -t 5000 -a dictation "Dictation" "$1" 2>/dev/null || true; }
+
+# A hard-failure notification that also plays the fail chime — used by the pre-record START bails
+# (server down, no mic, HFP didn't come up, failed to start), so any aborted dictation attempt is
+# audible, matching the fail chime finalize() plays for post-record failures.
+note_fail() { chime "$SND_FAIL"; note "$1"; }
 
 # Persistent "recording in progress" notification: -t 0 means it never auto-expires, so it's a
 # clear, standing visual indicator until either the user dismisses it manually or note_done()
@@ -177,7 +192,7 @@ is_terminal() {
 # Wrap dictated text so agent harnesses know it's voice input (may contain transcription
 # errors). auto (default): wrap only terminal/agent targets; always|never override.
 wrap() {
-  local t="$1" cls="$2" mode="${DICTATION_WRAP:-auto}"
+  local t="$1" cls="$2" mode="${DICTATION_WRAP:-@WRAP@}"
   case "$mode" in
     never)  printf '%s' "$t"; return ;;
     always) printf '<dictation>\n%s\n</dictation>' "$t"; return ;;
@@ -193,7 +208,7 @@ wrap() {
 # watcher archives whatever we copy, so transcripts land in history for free.
 deliver() {
   local raw="$1" cls out
-  cls=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // empty')
+  cls=$(desktop_active_class)
   out=$(wrap "$raw" "$cls")
   printf '%s' "$out" | wl-copy 9>&-   # 9>&- : don't let wl-copy's daemon inherit/hold the lock
   if [ -n "${DICTATION_NOPASTE:-}" ]; then
@@ -202,7 +217,7 @@ deliver() {
   fi
   sleep 0.12 # let clipboard settle / focus stabilize
   if is_terminal "$cls"; then
-    if wtype -M ctrl -M shift -k v -m shift -m ctrl 2>/dev/null; then
+    if desktop_paste terminal; then
       note_done "Pasted dictation -> $cls"
     else
       note_done "Copied (paste failed)"
@@ -211,7 +226,7 @@ deliver() {
   fi
   case "$cls" in
     dev.zed.Zed | firefox | org.mozilla.firefox | chromium-browser | Google-chrome | obsidian | Slack | vesktop | discord)
-      if wtype -M ctrl -k v -m ctrl 2>/dev/null; then
+      if desktop_paste normal; then
         note_done "Pasted -> $cls"
       else
         note_done "Copied (paste failed)"
@@ -233,9 +248,9 @@ finalize() {
   fi
   rm -f "$CARDF" "$PROFF"
   resume_players   # A2DP is back — resume whatever we paused, before the (slower) transcribe
-  chime "$SND_STOP"   # audible "recording stopped" — fires before the (slower) transcribe/paste
 
   if [ ! -s "$WAV" ] || [ "$(stat -c%s "$WAV" 2>/dev/null || echo 0)" -lt 4096 ]; then
+    chime "$SND_FAIL"
     note_done "No audio captured (headset disconnected?)"
     return 0
   fi
@@ -248,6 +263,7 @@ finalize() {
     # result — no whole-WAV POST needed, so the paste is near-instant.
     text="$stream_text"
     if [ -z "$text" ]; then
+      chime "$SND_FAIL"
       archive_txt "[no transcript — streaming produced no text]"
       note_done "No text (stream empty)"
       return 0
@@ -256,18 +272,21 @@ finalize() {
     # Normal mode, or streaming that hit a failed segment: transcribe the whole WAV in one shot.
     if ! json=$(curl --fail --max-time "$HTTP_TIMEOUT" -sS -H 'Content-Type: audio/wav' \
       --data-binary @"$WAV" -X POST "$URL"); then
+      chime "$SND_FAIL"
       archive_txt "[transcription failed — server cold/unreachable; audio saved to this .wav for manual re-run]"
       note_done "Transcription failed / server cold (audio saved)"
       return 0
     fi
     text=$(printf '%s' "$json" | jq -r '.text // empty' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     if [ -z "$text" ]; then
+      chime "$SND_FAIL"
       archive_txt "[no transcript — empty/error response: $(printf '%s' "$json" | jq -r '.error // "empty"')]"
       note_done "No text ($(printf '%s' "$json" | jq -r '.error // "empty response"'))"
       return 0
     fi
   fi
   archive_txt "$text"
+  chime "$SND_STOP"   # success cue — text came back; plays as we deliver
   deliver "$text"
 }
 
@@ -390,8 +409,8 @@ if systemctl --user is-active --quiet "$UNIT"; then
 fi
 
 # ---- START branch: begin a recording --------------------------------------
-if ! systemctl --user is-active --quiet whisper-npu; then
-  note "Dictation server is down (whisper-npu not running)"
+if ! systemctl --user is-active --quiet "$SERVER_UNIT"; then
+  note_fail "Dictation server is down ($SERVER_UNIT not running)"
   exit 1
 fi
 # Pick a capture source. Prefer a Bluetooth headset (force HFP/mSBC == 16k mono Whisper input);
@@ -441,7 +460,7 @@ if [ -n "${card:-}" ]; then
     sleep 0.1
   done
   if [ -z "$src" ]; then
-    note "HFP mic did not come up"
+    note_fail "HFP mic did not come up"
     # undo: restore the A2DP profile and resume anything we paused, so a failed start is invisible
     [ -s "$PROFF" ] && pactl set-card-profile "$card" "$(cat "$PROFF")" 2>/dev/null || true
     resume_players
@@ -456,10 +475,10 @@ else
   src=$(pactl get-default-source 2>/dev/null || true)
   case "${src:-}" in
     "")
-      note "No microphone available"
+      note_fail "No microphone available"
       exit 1 ;;
     *sof_sdw*)
-      note "No usable mic (internal mic is dead — connect a headset or USB mic)"
+      note_fail "No usable mic (internal mic is dead — connect a headset or USB mic)"
       exit 1 ;;
   esac
   # pactl can report the "@DEFAULT_SOURCE@" placeholder even when nothing is actually
@@ -467,10 +486,18 @@ else
   # bind that to a real node ("no target node available") and dies instantly. Confirm at least
   # one real, non-monitor source exists before trusting $src.
   if ! pactl list short sources | awk '$2 !~ /\.monitor$/{f=1} END{exit !f}'; then
-    note "No microphone available"
+    note_fail "No microphone available"
     exit 1
   fi
 fi
+
+# Human-friendly name of the capture device, shown in the "Recording..." notification so it's
+# always clear which mic is live (BT headset vs analog jack vs USB). Looks up the source's
+# Description by node name; falls back to the raw node name if that can't be resolved.
+mic_label=$(pactl list sources 2>/dev/null | awk -v n="Name: $src" '
+  index($0, n) { f = 1 }
+  f && /Description:/ { sub(/^[[:space:]]*Description:[[:space:]]*/, ""); print; exit }')
+[ -z "$mic_label" ] && mic_label="$src"
 
 # Record inside a transient user unit so it survives this process exiting. SIGINT on stop
 # finalizes the WAV. RuntimeMaxSec is only added when DICTATION_MAX_SECONDS is set — by default
@@ -509,7 +536,7 @@ if [ "$started" != "1" ]; then
   fi
   resume_players
   rm -f "$CARDF" "$PROFF"
-  note "Recording failed to start (mic unavailable?)"
+  note_fail "Recording failed to start (mic unavailable?)"
   exit 1
 fi
 
@@ -535,11 +562,11 @@ chime "$SND_START"   # audible "recording started"
 autostop_note=""
 [ "$watch_active" = "1" ] && [ -n "$AUTOSTOP" ] && [ "$AUTOSTOP" != "0" ] && autostop_note="auto-stop after ${AUTOSTOP}s silence, "
 if [ "$watch_active" = "1" ] && [ "$STREAM" = "1" ]; then
-  note_start "Recording... (live transcribe; ${autostop_note}toggle to stop)"
+  note_start "Recording from ${mic_label} (live transcribe; ${autostop_note}toggle to stop)"
 elif [ -n "$autostop_note" ]; then
-  note_start "Recording... (${autostop_note}or toggle)"
+  note_start "Recording from ${mic_label} (${autostop_note}or toggle)"
 elif [ -n "$MAX" ]; then
-  note_start "Recording... (toggle to stop, ${MAX}s cap)"
+  note_start "Recording from ${mic_label} (toggle to stop, ${MAX}s cap)"
 else
-  note_start "Recording... (toggle to stop)"
+  note_start "Recording from ${mic_label} (toggle to stop)"
 fi

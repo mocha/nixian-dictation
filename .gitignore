@@ -5,6 +5,12 @@ npu-image/*.wav
 # Reverse-engineering reference pulled out of the archived upstream image; kept locally only.
 npu-image/orig-*
 
+# Notification chimes: personally licensed (noncommercial) audio — NOT ours to redistribute,
+# and this repo is public. Kept local-only (present in the working tree, excluded from git); the
+# tool plays no chime if they're absent, so clones simply run silent. To version them, host on a
+# private remote (forge.lan) instead.
+sounds/*.mp3
+
 # Local scratch / logs
 *.log
 result*.txt
