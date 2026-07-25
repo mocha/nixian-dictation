@@ -28,6 +28,10 @@
 #                  near-instant paste at stop; default off) + DICTATION_STREAM_CHUNK (target segment
 #                  seconds, default 30), DICTATION_STREAM_MAXCHUNK (hard cap, default 45),
 #                  DICTATION_STREAM_QUIET (snap-to-quiet RMS threshold, default 0.05).
+#                DICTATION_DICT (path to a `wrongword=RightWord` replacement dictionary applied to
+#                  every transcript before archive/delivery; default
+#                  ~/.config/dictation/dictionary.txt, one rule per line, `#` comments, blank/missing
+#                  file = no-op; matches are whole-word + case-insensitive, e.g. `Dooley=Deuley`).
 
 DIR="${XDG_RUNTIME_DIR:-/tmp}/dictation"
 mkdir -p "$DIR"
@@ -67,6 +71,10 @@ SND_FAIL="${DICTATION_SND_FAIL:-fail.mp3}"      # recording/transcription failed
 # is handled out-of-band by the dictation-prune systemd --user timer, not here.
 ARCHIVE="${DICTATION_ARCHIVE:-1}"
 ARCHIVE_DIR="${DICTATION_ARCHIVE_DIR:-$HOME/Recordings/Dictation}"
+
+# Personal correction dictionary (misheard names/jargon Whisper consistently gets wrong).
+# See apply_dictionary() below for the file format.
+DICT="${DICTATION_DICT:-${XDG_CONFIG_HOME:-$HOME/.config}/dictation/dictionary.txt}"
 
 # Opt-in auto-stop: when set to a positive number of seconds, record via sox (instead of pw-record)
 # and let it end the recording after that much trailing silence — then a detached watcher runs the
@@ -204,6 +212,42 @@ wrap() {
   fi
 }
 
+# Apply the personal correction dictionary ($DICT) to a transcript. One rule per line, format
+# `wrongword=RightWord` (first `=` splits; `#` comments and blank lines are skipped). Matching is
+# whole-word (gawk's \y) and case-insensitive, so `Dooley=Deuley` also catches "dooley"/"DOOLEY".
+# Missing/empty dict file is a no-op. Runs once in finalize(), after streaming/whole-WAV text
+# converges, so it covers both delivery paths uniformly.
+apply_dictionary() {
+  local text="$1"
+  if [ ! -s "$DICT" ]; then
+    printf '%s' "$text"
+    return
+  fi
+  awk '
+    NR == FNR {
+      if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
+      eq = index($0, "=")
+      if (eq == 0) next
+      from = substr($0, 1, eq - 1)
+      to   = substr($0, eq + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", from)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", to)
+      if (from == "") next
+      gsub(/[\\^$.|?*+()\[\]{}]/, "\\\\&", from)  # escape regex metachars in the search word
+      cnt++; patterns[cnt] = from; repls[cnt] = to
+      next
+    }
+    {
+      line = $0
+      IGNORECASE = 1
+      for (i = 1; i <= cnt; i++) {
+        gsub("\\y" patterns[i] "\\y", repls[i], line)
+      }
+      print line
+    }
+  ' "$DICT" - <<<"$text"
+}
+
 # Copy the (possibly wrapped) text, then send the focused app's paste chord. cliphist's
 # watcher archives whatever we copy, so transcripts land in history for free.
 deliver() {
@@ -285,6 +329,7 @@ finalize() {
       return 0
     fi
   fi
+  text=$(apply_dictionary "$text")
   archive_txt "$text"
   chime "$SND_STOP"   # success cue — text came back; plays as we deliver
   deliver "$text"
