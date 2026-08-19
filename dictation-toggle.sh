@@ -242,6 +242,20 @@ finalize() {
 
   archive_wav   # persist the audio now, before transcription — any failure past here keeps the .wav
 
+  # A muted (or wrong) source yields a *full-length* WAV of digital silence, which sails past the
+  # size check above -- and Whisper answers silence with hallucinated filler ("you you you..."),
+  # which then gets pasted as if it were real dictation. Peak amplitude separates the two
+  # unambiguously: silence is ~0.0000, real speech is O(0.1-1.0). Bail before the POST.
+  if command -v sox >/dev/null 2>&1; then
+    local peak
+    peak=$(sox "$WAV" -n stat 2>&1 | awk '/^Maximum amplitude/{print $3; exit}')
+    if [ -n "$peak" ] && awk -v p="$peak" 'BEGIN{exit !(p+0 < 0.002)}'; then
+      archive_txt "[no transcript — captured audio is silent (peak amplitude $peak); mic muted, or the source produced no signal]"
+      note_done "No audio captured — mic was silent (muted?)"
+      return 0
+    fi
+  fi
+
   local json text
   if [ "$streamed" = "1" ] && [ "$stream_failed" = "0" ]; then
     # Streaming succeeded: segments were transcribed live as they closed. Deliver the stitched
@@ -471,6 +485,14 @@ else
     exit 1
   fi
 fi
+
+# A *muted* capture source doesn't fail, error, or produce a short file -- PipeWire happily streams
+# digital silence, so pw-record writes a full-length WAV of pure zeros and Whisper hallucinates
+# filler ("you you you...") onto it. Mute survives reboots (WirePlumber restores it) and it's easy
+# to fat-finger via the keyboard's mute key (right next to volume/play-pause) -- and easy to not
+# notice until the transcript is garbage. Nobody here mutes the mic on purpose, so just always
+# force it unmuted rather than tracking/restoring prior state.
+pactl set-source-mute "$src" 0 2>/dev/null || true
 
 # Record inside a transient user unit so it survives this process exiting. SIGINT on stop
 # finalizes the WAV. RuntimeMaxSec is only added when DICTATION_MAX_SECONDS is set — by default
