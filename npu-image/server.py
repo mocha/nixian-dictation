@@ -144,6 +144,7 @@ def transcribe():
 
 
 @app.route("/v1/audio/transcriptions", methods=["POST"])
+@app.route("/audio/transcriptions", methods=["POST"])  # base URL already ends in /v1
 def openai_transcriptions():
     """OpenAI-compatible endpoint: multipart/form-data with `file` (audio) and optional `model`
     and `response_format` (json|text|verbose_json). Lets any OpenAI SDK/tool point straight at the
@@ -171,6 +172,20 @@ def openai_transcriptions():
         return jsonify({"error": {"message": str(e), "type": "server_error"}}), 500
 
 
+@app.errorhandler(404)
+def unknown_route(_e):
+    """Clients disagree about where the OpenAI-compatible route lives: some want a base URL
+    ending in /v1 and append /audio/transcriptions, others post the whole path. Flask's stock
+    404 is an HTML page that tells you neither which path was tried nor which exist, and it
+    surfaces in a client's error dialog as a wall of markup. Log the path and answer in JSON."""
+    logger.warning("404 %s %s - known routes: %s", request.method, request.path,
+                   ", ".join(sorted(r.rule for r in app.url_map.iter_rules())))
+    return jsonify({"error": {
+        "message": f"no route for {request.method} {request.path}",
+        "type": "invalid_request_error",
+    }}), 404
+
+
 model_manager = ModelManager()
 
 # Startup diagnostics + best-effort pre-warm (do NOT crash the server if the NPU isn't ready;
@@ -191,10 +206,13 @@ except Exception as e:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     threads = int(os.environ.get("SERVER_THREADS", "4"))
+    # Default 0.0.0.0 because this backend runs inside a container: podman publishes the port
+    # to 127.0.0.1 on the host, so the container-internal bind is not the exposure boundary.
+    host = os.environ.get("HOST", "0.0.0.0")
     try:
         from waitress import serve
-        logger.info("Serving via waitress on 0.0.0.0:%d (threads=%d)", port, threads)
-        serve(app, host="0.0.0.0", port=port, threads=threads)
+        logger.info("Serving via waitress on %s:%d (threads=%d)", host, port, threads)
+        serve(app, host=host, port=port, threads=threads)
     except ImportError:
         logger.warning("waitress unavailable — falling back to the Flask dev server (single-threaded)")
-        app.run(host="0.0.0.0", port=port)
+        app.run(host=host, port=port)

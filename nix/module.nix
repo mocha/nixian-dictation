@@ -70,7 +70,38 @@ in
     port = lib.mkOption {
       type = lib.types.port;
       default = 8009;
-      description = "Loopback port the server binds and the client posts to.";
+      description = "TCP port the server binds and the client posts to.";
+    };
+
+    bind = lib.mkOption {
+      type = lib.types.str;
+      default = "127.0.0.1";
+      example = "*";
+      description = ''
+        Address the server binds. Loopback by default: nothing in the transcription API
+        authenticates, so on a single-user desktop the toggle client should be its only caller.
+
+        Set this to "*" (every interface, IPv4 and IPv6) to let other machines reach it - e.g.
+        pointing a laptop's dictation client at the OpenAI-compatible POST
+        /v1/audio/transcriptions endpoint. That also means anyone who can reach the port can
+        spend your GPU on their audio and read the transcript back, so open it only to a network
+        you trust, via `openFirewall` rather than a blanket rule.
+
+        Prefer "*" over "0.0.0.0" if clients reach this host by name rather than by address:
+        0.0.0.0 is IPv4-only, so a hostname that also resolves to an AAAA record will send
+        IPv6-preferring clients to an address nothing is listening on.
+
+        The toggle client keeps posting to 127.0.0.1, which both "*" and "0.0.0.0" still serve.
+      '';
+    };
+
+    openFirewall = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Open `port` in the system firewall. Only meaningful alongside a non-loopback `bind`;
+        setting it without one is an assertion failure rather than a silent no-op.
+      '';
     };
 
     serverUnit = lib.mkOption {
@@ -102,7 +133,12 @@ in
     assertions = [{
       assertion = cfg.backend == "cuda-local";
       message = "services.dictation: only backend = \"cuda-local\" is implemented by this module.";
+    } {
+      assertion = !cfg.openFirewall || !(builtins.elem cfg.bind [ "127.0.0.1" "::1" "localhost" ]);
+      message = "services.dictation: openFirewall = true needs a non-loopback bind (e.g. bind = \"*\"); otherwise the port is opened while nothing listens on it.";
     }];
+
+    networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
 
     systemd.user.services.${cfg.serverUnit} = {
       description = "Dictation transcription server (faster-whisper, ${cfg.device}/${cfg.computeType})";
@@ -113,6 +149,7 @@ in
         WHISPER_DEFAULT_MODEL = cfg.model;
         WHISPER_MODELS = lib.concatStringsSep "," allModels;
         PORT = toString cfg.port;
+        HOST = cfg.bind;
         # libcuda.so.1 comes from the NVIDIA *driver* (impure) — not in the nix closure — so it
         # has to be found at /run/opengl-driver/lib. Everything else (cudart, cublas, cuDNN) is
         # RPATH'd from the nix CUDA packages ctranslate2 links.

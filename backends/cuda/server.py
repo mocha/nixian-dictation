@@ -21,6 +21,7 @@ Env:
   WHISPER_DEVICE=cuda|cpu|auto   (default cuda)   WHISPER_COMPUTE_TYPE=float16|int8_float16|int8
   WHISPER_DEFAULT_MODEL=small.en                  WHISPER_MODELS=small.en,large-v3  (/models list)
   WHISPER_BEAM_SIZE=5   WHISPER_VAD=1|0   PORT=5000   SERVER_THREADS=4
+  HOST=127.0.0.1  (bind address; 0.0.0.0 exposes it to the network — see __main__)
 """
 import io
 import os
@@ -143,6 +144,7 @@ def transcribe():
 
 
 @app.route("/v1/audio/transcriptions", methods=["POST"])
+@app.route("/audio/transcriptions", methods=["POST"])  # base URL already ends in /v1
 def openai_transcriptions():
     """OpenAI-compatible: multipart with `file` (audio) + optional `model` / `response_format`
     (json|text|verbose_json). Lets any OpenAI SDK point at this server; an unknown `model`
@@ -169,6 +171,20 @@ def openai_transcriptions():
         return jsonify({"error": {"message": str(e), "type": "server_error"}}), 500
 
 
+@app.errorhandler(404)
+def unknown_route(_e):
+    """Clients disagree about where the OpenAI-compatible route lives: some want a base URL
+    ending in /v1 and append /audio/transcriptions, others post the whole path. Flask's stock
+    404 is an HTML page that tells you neither which path was tried nor which exist, and it
+    surfaces in a client's error dialog as a wall of markup. Log the path and answer in JSON."""
+    logger.warning("404 %s %s - known routes: %s", request.method, request.path,
+                   ", ".join(sorted(r.rule for r in app.url_map.iter_rules())))
+    return jsonify({"error": {
+        "message": f"no route for {request.method} {request.path}",
+        "type": "invalid_request_error",
+    }}), 404
+
+
 model_manager = ModelManager()
 
 # Startup diagnostics + best-effort pre-warm. Never crash the server if the model/GPU isn't ready
@@ -189,10 +205,24 @@ except Exception as e:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     threads = int(os.environ.get("SERVER_THREADS", "4"))
+    # Loopback by default: on a single-user desktop the toggle client is the only caller,
+    # and nothing here authenticates. HOST=0.0.0.0 (or a specific address) opens it to other
+    # machines — which also means anyone who can reach the port can spend your GPU on their
+    # audio, so pair it with a firewall rule scoped to the network you actually trust.
+    # HOST="*" listens on every interface on BOTH IPv4 and IPv6. Prefer it over 0.0.0.0 whenever
+    # clients reach this box by name: a .lan host with an AAAA record (Firewalla hands out ULAs)
+    # sends any happy-eyeballs client - Electron, browsers, curl - to the IPv6 address first, and
+    # a 0.0.0.0 bind never answers there. That failure looks like a refused connection or a bogus
+    # URL at the client, never like an IPv6 problem, so it costs an afternoon to find.
+    host = os.environ.get("HOST", "127.0.0.1")
     try:
         from waitress import serve
-        logger.info("Serving via waitress on 127.0.0.1:%d (threads=%d)", port, threads)
-        serve(app, host="127.0.0.1", port=port, threads=threads)
+        if host == "*":
+            logger.info("Serving via waitress on *:%d (IPv4+IPv6, threads=%d)", port, threads)
+            serve(app, listen=f"*:{port}", threads=threads)
+        else:
+            logger.info("Serving via waitress on %s:%d (threads=%d)", host, port, threads)
+            serve(app, host=host, port=port, threads=threads)
     except ImportError:
-        logger.warning("waitress unavailable — falling back to the Flask dev server")
-        app.run(host="127.0.0.1", port=port)
+        logger.warning("waitress unavailable - falling back to the Flask dev server")
+        app.run(host=("::" if host == "*" else host), port=port)
