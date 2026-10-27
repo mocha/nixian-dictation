@@ -21,4 +21,6 @@ let
     ];
   };
 in
-pkgs.python3.withPackages (ps: with ps; [ faster-whisper flask waitress ])
+# librosa + numpy: two-speaker detection / pitch naming (backends/common/dual.py). Adding packages
+# here only re-links the env; the CUDA ctranslate2 above is reused, not rebuilt.
+pkgs.python3.withPackages (ps: with ps; [ faster-whisper flask waitress librosa numpy ])

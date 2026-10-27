@@ -54,7 +54,9 @@ ENV WHISPER_DEVICE=NPU \
     WHISPER_DEFAULT_MODEL=whisper-small.en-fp16-ov
 
 WORKDIR /app
-COPY server.py /app/server.py
+# Build context is the repo root (shared modules live in backends/common):
+#   podman build -t whisper-npu-ptl:local -f npu-image/Dockerfile .
+COPY npu-image/server.py backends/common/dual.py backends/common/archive.py /app/
 
 EXPOSE 5000
 CMD ["python3", "/app/server.py"]

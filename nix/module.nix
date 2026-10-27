@@ -14,6 +14,7 @@ let
   # one-time pre-warm build instead of recompiling the CUDA stack.
   whisperEnv = import ./whisper-env.nix { nixpkgs = pkgs.path; };
   serverPy = ../backends/cuda/server.py;
+  commonPy = ../backends/common;   # dual.py + archive.py, shared with the NPU backend
   allModels = lib.unique ([ cfg.model ] ++ cfg.models);
 in
 {
@@ -104,6 +105,29 @@ in
       '';
     };
 
+    archiveDir = lib.mkOption {
+      type = lib.types.str;
+      default = "%h/Recordings/Dictation";
+      example = "/mnt/nas/Transcripts";
+      description = ''
+        Where the server archives every request it transcribes (audio as uploaded + .txt transcript +
+        .json metadata), e.g. OpenWhispr traffic. "off" disables. systemd specifiers (%h) work.
+        Defaults to the toggle client's own archive dir; the client opts its requests out
+        (archive=0) because it archives them itself.
+      '';
+    };
+
+    voices = lib.mkOption {
+      type = lib.types.attrsOf lib.types.number;
+      default = { };
+      example = { Alice = 205; Bob = 125; };
+      description = ''
+        Median voice pitch (Hz) per person, used to label two-speaker (one lav per stereo channel)
+        transcripts with names instead of A/B. Empty = read ~/.config/dictation/voices.json
+        (same {"Name": hz} shape) at request time, so it can be tuned without a rebuild.
+      '';
+    };
+
     serverUnit = lib.mkOption {
       type = lib.types.str;
       default = "dictation-whisper";
@@ -155,6 +179,11 @@ in
         # RPATH'd from the nix CUDA packages ctranslate2 links.
         LD_LIBRARY_PATH = "/run/opengl-driver/lib";
         HF_HOME = "%h/.cache/huggingface";
+        PYTHONPATH = "${commonPy}";
+        WHISPER_ARCHIVE_DIR = cfg.archiveDir;
+        WHISPER_VOICES = if cfg.voices == { }
+          then "%h/.config/dictation/voices.json"
+          else "${pkgs.writeText "dictation-voices.json" (builtins.toJSON cfg.voices)}";
       };
       serviceConfig = {
         ExecStart = "${whisperEnv}/bin/python ${serverPy}";

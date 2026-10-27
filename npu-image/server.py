@@ -14,8 +14,15 @@ Changes from upstream:
   - inference is serialized by a lock (one NPU WhisperPipeline can't run concurrent generate()s)
     and served by waitress with worker threads, so /health stays responsive even while a slow
     model-load or transcription holds the lock
-API: POST /transcribe[/<model>] with a RAW audio body -> {"text": ...} | {"error": ...}
-     POST /v1/audio/transcriptions (multipart) -> OpenAI transcription response
+  - stereo uploads are checked for two separate speakers (one lav per channel, see
+    backends/common/dual.py); if so the reply is a time-ordered "[m:ss][A] ..." transcript, with A/B
+    replaced by names when WHISPER_VOICES (default ~/.whisper/models/voices.json,
+    {"Name": median_pitch_hz, ...}) matches the two voices by pitch
+  - every request is archived (audio + transcript + metadata) unless `archive=0`; see
+    backends/common/archive.py (WHISPER_ARCHIVE_DIR)
+API: POST /transcribe[/<model>][?speakers=auto|off][&archive=0] with a RAW audio body
+       -> {"text": ..., "mode": "mono"|"dual"[, "segments", "speakers"][, "archived"]} | {"error": ...}
+     POST /v1/audio/transcriptions (multipart; optional `speakers`, `archive` fields) -> OpenAI response
      POST /warm[/<model>] -> {"warm": true, "model": ...} | {"error": ...}
 """
 import io
@@ -28,6 +35,9 @@ import librosa
 import openvino
 import openvino_genai
 from flask import Flask, request, jsonify
+
+import archive
+import dual
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +54,10 @@ DEVICE = os.environ.get("WHISPER_DEVICE", "NPU")
 # (the classic "you"/"thank you" hallucinations) and transcribing it wastes NPU time. top_db is
 # the librosa threshold (dB below peak) treated as silence; WHISPER_TRIM_TOP_DB=0 disables it.
 TRIM_TOP_DB = int(os.environ.get("WHISPER_TRIM_TOP_DB", "35"))
+# Voice profiles for naming two-speaker channels: {"Name": median_pitch_hz, ...}. Default lives in the
+# bind-mounted models dir so it can be edited without rebuilding; re-read per two-speaker request.
+VOICES_PATH = os.environ.get("WHISPER_VOICES",
+                             os.path.join(os.path.expanduser("~"), ".whisper", "models", "voices.json"))
 
 
 class ModelManager:
@@ -73,18 +87,41 @@ class ModelManager:
                 if os.path.isdir(os.path.join(self.models_dir, d))]
 
 
-def _transcribe(audio_data, model_name):
-    """Decode → trim silence → transcribe. librosa decode/trim runs lock-free (CPU); only the
-    NPU model-load + generate() is serialized under _infer_lock. Returns the transcript string;
-    raises FileNotFoundError for an unknown model, other exceptions on failure."""
-    speech, _ = librosa.load(io.BytesIO(audio_data), sr=16000)
+def _trim(speech):
     if TRIM_TOP_DB > 0 and speech.size:
         trimmed, _ = librosa.effects.trim(speech, top_db=TRIM_TOP_DB)
         if trimmed.size:  # keep the trim only if it left actual audio (not an all-silent clip)
-            speech = trimmed
-    with _infer_lock:
-        pipeline = model_manager.load_model(model_name)
-        return str(pipeline.generate(speech))
+            return trimmed
+    return speech
+
+
+def _transcribe(audio_data, model_name, speakers="auto"):
+    """Decode → (stereo: detect two speakers) → transcribe. librosa decode/trim and the dual
+    analysis run lock-free (CPU); only the NPU model-load + generate() is serialized under
+    _infer_lock. Returns {"text", "mode"[, "segments", "speakers"]}; raises FileNotFoundError for an
+    unknown model, other exceptions on failure."""
+    audio, _ = librosa.load(io.BytesIO(audio_data), sr=16000, mono=False)
+    logger.info("input: %d ch, %.1fs, speakers=%s", 1 if audio.ndim == 1 else audio.shape[0],
+                audio.shape[-1] / 16000, speakers)
+
+    def generate(speech):
+        with _infer_lock:
+            return str(model_manager.load_model(model_name).generate(speech))
+
+    info = dual.detect(audio, speakers)
+    if info is not None:
+        return dual.transcribe(audio, info, generate, dual.load_voices(VOICES_PATH))
+    return {"text": generate(_trim(librosa.to_mono(audio) if audio.ndim == 2 else audio)),
+            "mode": "mono"}
+
+
+def _handle(audio_data, model_name, params, filename=None):
+    """_transcribe wrapped in the request archive. params: the query args or form fields."""
+    meta = {"endpoint": request.path, "model": model_name, "client": request.remote_addr,
+            "user_agent": request.headers.get("User-Agent")}
+    speakers = params.get("speakers", "auto")
+    return archive.run(audio_data, lambda: _transcribe(audio_data, model_name, speakers),
+                       filename, meta, archive.wanted(params.get("archive", "1")))
 
 
 @app.route("/health", methods=["GET"])
@@ -130,7 +167,7 @@ def transcribe_with_model(model_name):
         audio_data = request.get_data()
         if not audio_data:
             return jsonify({"error": "No audio data"}), 400
-        return jsonify({"text": _transcribe(audio_data, model_name)})
+        return jsonify(_handle(audio_data, model_name, request.args))
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
@@ -147,9 +184,11 @@ def transcribe():
 @app.route("/audio/transcriptions", methods=["POST"])  # base URL already ends in /v1
 def openai_transcriptions():
     """OpenAI-compatible endpoint: multipart/form-data with `file` (audio) and optional `model`
-    and `response_format` (json|text|verbose_json). Lets any OpenAI SDK/tool point straight at the
-    NPU server. `model` maps to a local model dir; an unknown/omitted value (e.g. OpenAI's
-    "whisper-1") falls back to the server default."""
+    and `response_format` (json|text|verbose_json), plus non-OpenAI `speakers` (auto|off, default
+    auto: a two-speaker stereo upload gets the same "[m:ss][Name] ..." transcript as /transcribe, and
+    verbose_json carries its segments) and `archive` (0 = don't archive this request). Lets any
+    OpenAI SDK/tool point straight at the NPU server. `model` maps to a local model dir; an
+    unknown/omitted value (e.g. OpenAI's "whisper-1") falls back to the server default."""
     try:
         f = request.files.get("file")
         if f is None:
@@ -160,12 +199,16 @@ def openai_transcriptions():
         model_name = request.form.get("model") or model_manager.default_model
         if model_name not in model_manager.list_models():
             model_name = model_manager.default_model  # accept whisper-1 etc. → our default
-        text = _transcribe(audio_data, model_name)
+        result = _handle(audio_data, model_name, request.form, f.filename)
+        text = result["text"]
         fmt = (request.form.get("response_format") or "json").lower()
         if fmt == "text":
             return app.response_class(text, mimetype="text/plain; charset=utf-8")
         if fmt == "verbose_json":
-            return jsonify({"task": "transcribe", "text": text})
+            out = {"task": "transcribe", "text": text}
+            if result["mode"] == "dual":
+                out["segments"] = dual.openai_segments(result)
+            return jsonify(out)
         return jsonify({"text": text})
     except Exception as e:
         logger.error("Error (v1): %s", e)

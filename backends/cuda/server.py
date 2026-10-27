@@ -6,8 +6,10 @@ Speaks the *same* HTTP contract as the NPU backend (`backends/npu/server.py`), s
   GET  /health                          -> {requested_device, available_devices, loaded, default}
   GET  /models                          -> {models: [...]}
   POST /warm[/<model>]                  -> {warm, model} | {error}
-  POST /transcribe[/<model>]  (raw body)-> {text} | {error}
+  POST /transcribe[/<model>]  (raw body)-> {text, mode[, segments, speakers][, archived]} | {error}
   POST /v1/audio/transcriptions (mp)    -> OpenAI-compatible {text}
+  (both take `speakers=auto|off` and `archive=0`: two-speaker stereo detection and the request
+   archive, shared with the NPU backend via backends/common/{dual,archive}.py)
 
 Differences from the NPU/OpenVINO backend (deliberate, same external behaviour):
   - engine is faster-whisper (CTranslate2); on Dynamo that runs on the RTX 4070 Ti via CUDA.
@@ -22,15 +24,22 @@ Env:
   WHISPER_DEFAULT_MODEL=small.en                  WHISPER_MODELS=small.en,large-v3  (/models list)
   WHISPER_BEAM_SIZE=5   WHISPER_VAD=1|0   PORT=5000   SERVER_THREADS=4
   HOST=127.0.0.1  (bind address; 0.0.0.0 exposes it to the network — see __main__)
+  WHISPER_ARCHIVE_DIR=~/Recordings/Dictation|off   WHISPER_VOICES=~/.config/dictation/voices.json
 """
 import io
 import os
 import logging
 import threading
 
+import av
 import ctranslate2
+import numpy as np
 from faster_whisper import WhisperModel
+from faster_whisper.audio import decode_audio
 from flask import Flask, request, jsonify
+
+import archive
+import dual
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -50,6 +59,9 @@ DEFAULT_MODEL = os.environ.get("WHISPER_DEFAULT_MODEL", "small.en")
 MODELS = [m for m in os.environ.get("WHISPER_MODELS", DEFAULT_MODEL).split(",") if m]
 BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
 VAD = os.environ.get("WHISPER_VAD", "1") != "0"
+# Voice profiles for naming two-speaker channels ({"Name": median_pitch_hz}); re-read per request.
+VOICES_PATH = os.environ.get("WHISPER_VOICES",
+                             os.path.join(os.path.expanduser("~"), ".config", "dictation", "voices.json"))
 
 
 class ModelManager:
@@ -69,16 +81,46 @@ class ModelManager:
         return MODELS
 
 
-def _transcribe(audio_data, model_name):
-    """Decode → VAD-trim → transcribe. faster-whisper decodes the raw body via PyAV and (with
-    vad_filter) drops non-speech, so silence doesn't produce phantom tokens. Returns the joined
-    transcript string; raises on failure (unknown/failed model load, decode error)."""
-    with _infer_lock:
-        model = model_manager.load_model(model_name)
-        segments, _info = model.transcribe(
-            io.BytesIO(audio_data), beam_size=BEAM_SIZE, vad_filter=VAD
-        )
-        return "".join(seg.text for seg in segments).strip()
+def _channels(audio_data):
+    """Channel count of the upload as sent (decode_audio below always yields stereo), for the log:
+    it's how to tell whether a client is sending a two-lav stereo recording at all."""
+    try:
+        with av.open(io.BytesIO(audio_data)) as c:
+            return c.streams.audio[0].channels
+    except Exception:
+        return 0
+
+
+def _transcribe(audio_data, model_name, speakers="auto"):
+    """Decode (PyAV, any container ffmpeg reads) → (stereo: detect two speakers) → transcribe.
+    Decode and the dual analysis run lock-free; only model-load + inference take _infer_lock.
+    faster-whisper's vad_filter drops non-speech, so silence doesn't produce phantom tokens.
+    Returns {"text", "mode"[, "segments", "speakers"]}; raises on failure."""
+    left, right = decode_audio(io.BytesIO(audio_data), sampling_rate=16000, split_stereo=True)
+    audio = np.stack([left, right])
+    logger.info("input: %d ch, %.1fs, speakers=%s", _channels(audio_data), audio.shape[1] / 16000,
+                speakers)
+
+    def run(speech):
+        with _infer_lock:
+            model = model_manager.load_model(model_name)
+            segments, _info = model.transcribe(speech, beam_size=BEAM_SIZE, vad_filter=VAD)
+            return "".join(seg.text for seg in segments).strip()
+
+    info = dual.detect(audio, speakers)
+    if info is not None:
+        return dual.transcribe(audio, info, run, dual.load_voices(VOICES_PATH))
+    # mono uploads come back from split_stereo as two identical channels; the mean is the original
+    return {"text": run(audio.mean(axis=0)), "mode": "mono"}
+
+
+def _handle(audio_data, model_name, params, filename=None):
+    """_transcribe wrapped in the request archive. params: the query args or form fields."""
+    meta = {"endpoint": request.path, "model": model_name, "client": request.remote_addr,
+            "user_agent": request.headers.get("User-Agent")}
+    speakers = params.get("speakers", "auto")
+    return archive.run(audio_data, lambda: _transcribe(audio_data, model_name, speakers),
+                       filename, meta, archive.wanted(params.get("archive", "1")))
 
 
 def _available_devices():
@@ -132,7 +174,7 @@ def transcribe_with_model(model_name):
         audio_data = request.get_data()
         if not audio_data:
             return jsonify({"error": "No audio data"}), 400
-        return jsonify({"text": _transcribe(audio_data, model_name)})
+        return jsonify(_handle(audio_data, model_name, request.args))
     except Exception as e:
         logger.error("Error: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -147,8 +189,10 @@ def transcribe():
 @app.route("/audio/transcriptions", methods=["POST"])  # base URL already ends in /v1
 def openai_transcriptions():
     """OpenAI-compatible: multipart with `file` (audio) + optional `model` / `response_format`
-    (json|text|verbose_json). Lets any OpenAI SDK point at this server; an unknown `model`
-    (e.g. "whisper-1") falls back to the server default."""
+    (json|text|verbose_json), plus non-OpenAI `speakers` (auto|off) and `archive` (0 = skip).
+    Lets any OpenAI SDK point at this server; an unknown `model` (e.g. "whisper-1") falls back to
+    the server default. A two-speaker upload's text is the "[m:ss][Name] ..." transcript and
+    verbose_json carries its segments."""
     try:
         f = request.files.get("file")
         if f is None:
@@ -159,12 +203,16 @@ def openai_transcriptions():
         model_name = request.form.get("model") or model_manager.default_model
         if model_name not in model_manager.list_models():
             model_name = model_manager.default_model
-        text = _transcribe(audio_data, model_name)
+        result = _handle(audio_data, model_name, request.form, f.filename)
+        text = result["text"]
         fmt = (request.form.get("response_format") or "json").lower()
         if fmt == "text":
             return app.response_class(text, mimetype="text/plain; charset=utf-8")
         if fmt == "verbose_json":
-            return jsonify({"task": "transcribe", "text": text})
+            out = {"task": "transcribe", "text": text}
+            if result["mode"] == "dual":
+                out["segments"] = dual.openai_segments(result)
+            return jsonify(out)
         return jsonify({"text": text})
     except Exception as e:
         logger.error("Error (v1): %s", e)

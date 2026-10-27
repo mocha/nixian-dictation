@@ -32,6 +32,8 @@
 #                  every transcript before archive/delivery; default
 #                  ~/.config/dictation/dictionary.txt, one rule per line, `#` comments, blank/missing
 #                  file = no-op; matches are whole-word + case-insensitive, e.g. `Dooley=Deuley`).
+#                DICTATION_SPEAKERS=auto|off (two-speaker transcripts from a 2-channel mic; see below),
+#                DICTATION_DUAL_PASTE=1 (paste two-speaker transcripts too; default copy-only).
 
 DIR="${XDG_RUNTIME_DIR:-/tmp}/dictation"
 mkdir -p "$DIR"
@@ -71,6 +73,12 @@ SND_FAIL="${DICTATION_SND_FAIL:-fail.mp3}"      # recording/transcription failed
 # is handled out-of-band by the dictation-prune systemd --user timer, not here.
 ARCHIVE="${DICTATION_ARCHIVE:-1}"
 ARCHIVE_DIR="${DICTATION_ARCHIVE_DIR:-$HOME/Recordings/Dictation}"
+# The server archives every request it gets too (backends/common/archive.py), by default into this
+# same dir. While we archive locally, opt our requests out there so nothing is saved twice; with
+# DICTATION_ARCHIVE=0 the server's archive becomes this client's archive. Stream segments are never
+# archived server-side (they're fragments of the recording we keep whole).
+SERVER_ARCHIVE=1
+[ "$ARCHIVE" = "0" ] || SERVER_ARCHIVE=0
 
 # Personal correction dictionary (misheard names/jargon Whisper consistently gets wrong).
 # See apply_dictionary() below for the file format.
@@ -106,6 +114,15 @@ STREAM="${DICTATION_STREAM:-0}"
 STREAM_CHUNK="${DICTATION_STREAM_CHUNK:-30}"       # target segment length (s) before seeking a cut
 STREAM_MAXCHUNK="${DICTATION_STREAM_MAXCHUNK:-45}" # hard cap (s): force a cut even if nothing quieted
 STREAM_QUIET="${DICTATION_STREAM_QUIET:-0.05}"     # RMS below which a 1s window is a snap-able dip
+
+# Two-speaker mode: a 2-channel non-Bluetooth source (the Rode Wireless MICRO receiver: one lav per
+# channel) is recorded in stereo, and the server checks whether the channels really carry different
+# speakers -- if so it returns a time-ordered "[m:ss][A] ..." transcript, otherwise it downmixes and
+# behaves exactly like mono. Streaming/auto-stop slice the WAV as mono PCM, so they force mono.
+# Two-speaker results are copy-only unless DICTATION_DUAL_PASTE=1: a long conversation transcript is
+# rarely meant for whatever window has focus.
+SPEAKERS="${DICTATION_SPEAKERS:-auto}"
+copy_only=0         # finalize sets this for a two-speaker transcript (see DICTATION_DUAL_PASTE)
 streamed=0          # set by the __watch process only when it actually streamed segments
 stream_text=""      # accumulated per-segment transcripts (built up inside the __watch process)
 stream_failed=0     # a segment POST failed → finalize falls back to whole-WAV transcription
@@ -255,6 +272,10 @@ deliver() {
   cls=$(desktop_active_class)
   out=$(wrap "$raw" "$cls")
   printf '%s' "$out" | wl-copy 9>&-   # 9>&- : don't let wl-copy's daemon inherit/hold the lock
+  if [ "$copy_only" = "1" ]; then
+    note_done "Copied two-speaker transcript"
+    return
+  fi
   if [ -n "${DICTATION_NOPASTE:-}" ]; then
     note_done "Copied (no-paste)"
     return
@@ -329,7 +350,7 @@ finalize() {
   else
     # Normal mode, or streaming that hit a failed segment: transcribe the whole WAV in one shot.
     if ! json=$(curl --fail --max-time "$HTTP_TIMEOUT" -sS -H 'Content-Type: audio/wav' \
-      --data-binary @"$WAV" -X POST "$URL"); then
+      --data-binary @"$WAV" -X POST "$URL?speakers=$SPEAKERS&archive=$SERVER_ARCHIVE"); then
       chime "$SND_FAIL"
       archive_txt "[transcription failed — server cold/unreachable; audio saved to this .wav for manual re-run]"
       note_done "Transcription failed / server cold (audio saved)"
@@ -341,6 +362,9 @@ finalize() {
       archive_txt "[no transcript — empty/error response: $(printf '%s' "$json" | jq -r '.error // "empty"')]"
       note_done "No text ($(printf '%s' "$json" | jq -r '.error // "empty response"'))"
       return 0
+    fi
+    if [ "$(printf '%s' "$json" | jq -r '.mode // empty')" = "dual" ] && [ -z "${DICTATION_DUAL_PASTE:-}" ]; then
+      copy_only=1
     fi
   fi
   text=$(apply_dictionary "$text")
@@ -368,7 +392,7 @@ flush_segment() {
     return 0
   fi
   if ! json=$(curl --fail --max-time "$HTTP_TIMEOUT" -sS -H 'Content-Type: audio/wav' \
-       --data-binary @"$seg" -X POST "$URL" 2>/dev/null); then
+       --data-binary @"$seg" -X POST "$URL?speakers=off&archive=0" 2>/dev/null); then
     stream_failed=1
     rm -f "$seg"
     return 0
@@ -575,9 +599,18 @@ systemctl --user reset-failed "$UNIT" 2>/dev/null || true
 runargs=(--user --quiet --collect --unit="$UNIT" --property=KillSignal=SIGINT)
 [ -n "$MAX" ] && runargs+=(--property=RuntimeMaxSec="$MAX")
 
+# Stereo only for a 2-channel non-BT source with two-speaker mode on and nothing slicing the WAV as
+# mono PCM (streaming/auto-stop). `pactl list short sources` column 5 is the channel count ("2ch").
+channels=1
+if [ -z "$card" ] && [ "$SPEAKERS" != "off" ] && [ "$STREAM" != "1" ] \
+   && { [ -z "$AUTOSTOP" ] || [ "$AUTOSTOP" = "0" ]; } \
+   && [ "$(pactl list short sources | awk -v s="$src" '$2 == s {print $5; exit}')" = "2ch" ]; then
+  channels=2
+fi
+
 pwrec=$(command -v pw-record)
 systemd-run "${runargs[@]}" \
-  -- "$pwrec" --target "$src" --rate 16000 --channels 1 --format s16 "$WAV"
+  -- "$pwrec" --target "$src" --rate 16000 --channels "$channels" --format s16 "$WAV"
 
 # systemd-run returns once the transient unit is *queued*, not once pw-record has actually opened
 # the device -- an invalid/vanished source fails inside the unit a beat later. Confirm it's really

@@ -186,7 +186,7 @@ runs the server as a `systemd --user` unit, and fetches the model on first use.
 Not yet wired into the module; `nixian` still runs this imperatively.
 
 
-1. **Build the image:** `cd npu-image && podman build -t whisper-npu-ptl:local .`
+1. **Build the image:** `podman build -t whisper-npu-ptl:local -f npu-image/Dockerfile .` (from the repo root)
 2. **Fetch the model:** `git clone https://huggingface.co/OpenVINO/whisper-small.en-fp16-ov ~/.whisper/models/whisper-small.en-fp16-ov` (with git-lfs).
 3. **Verify NPU:** run the image with `--device=/dev/accel/accel0 --device=/dev/dri … python3 -c "import openvino; print(openvino.Core().available_devices)"` → expect `['CPU', 'NPU']`.
 4. **NixOS:** add `virtualisation.podman.enable`, subuid/subgid + `linger` for your user, the `dictation` package (`callPackage ./pkgs/dictation {}`), and a `systemd.user.services.whisper-npu` that runs the container with the model mounted and bound to `127.0.0.1:8009`. Add `wtype`, `cliphist`, `fuzzel`.
